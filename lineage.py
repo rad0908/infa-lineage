@@ -36,12 +36,22 @@ def _mapping_name_by_instance_id(instance_id: str) -> str:
 def find_target_ports_by_field(field_like: str) -> List[Dict]:
     field_like = (field_like or "").lower().replace("_", "")
     out = []
+
     ports = st.all_rows("ports")
-    insts = _index_instances()
+    insts = st.by_id("instances", "instance_id")
+    edges = st.all_rows("edges")
+    has_out = {e["from_port_id"] for e in edges}  # anything with outbound edge is not a sink
+
     for p in ports:
         inst = insts.get(p["instance_id"])
-        if not inst or inst["type"] != "Target":
+        if not inst:
             continue
+
+        # target-ish if labeled Target OR it's an INPUT port with no outbound edges (graph sink)
+        is_targetish = (inst.get("type") == "Target") or (p["direction"] == "INPUT" and p["port_id"] not in has_out)
+        if not is_targetish:
+            continue
+
         norm = p["name"].lower().replace("_", "")
         if field_like in norm:
             out.append({
@@ -49,9 +59,11 @@ def find_target_ports_by_field(field_like: str) -> List[Dict]:
                 "instance_id": p["instance_id"],
                 "port_name": p["name"],
                 "instance_name": inst["name"],
-                "mapping_name": _mapping_name_by_instance_id(p["instance_id"])
+                "mapping_name": next((m["name"] for m in st.all_rows("mappings")
+                                      if m["mapping_id"] == inst["mapping_id"]), "")
             })
     return out
+
 
 def attach_expr_and_join(from_port_id: str, from_instance_id: str) -> Dict[str, str]:
     exprs = [e for e in st.all_rows("expressions") if e["port_id"] == from_port_id and e["kind"] == "expr"]

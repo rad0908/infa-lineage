@@ -1,16 +1,27 @@
-# parser_infa.py
 from lxml import etree as ET
-from typing import List, Dict, Tuple
+from typing import List, Dict
 import re
 import storage as st
+
 
 def _id(*parts) -> str:
     return ":".join(parts)
 
+
 def _norm(s: str) -> str:
     return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
+
 def parse_mapping_xml(xml_path: str) -> str:
+    """
+    Parse a PowerCenter XML where <SOURCE>/<TARGET> may be defined at the FOLDER level
+    (outside the MAPPING) and referenced via <INSTANCE> inside the MAPPING.
+
+    - Creates instances and ports for Transformations, Sources, Targets.
+    - Adds intra-transformation edges (inputs -> outputs) based on expressions or fallback.
+    - Adds inter-instance edges from <CONNECTOR>.
+    - Persists physical objects and mapping<->object links.
+    """
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
@@ -19,6 +30,9 @@ def parse_mapping_xml(xml_path: str) -> str:
         raise ValueError(f"FOLDER not found in {xml_path}")
 
     mapping = folder_el.find("./MAPPING")
+    if mapping is None:
+        # Some exports put MAPPING directly under root
+        mapping = root.find(".//MAPPING")
     if mapping is None:
         raise ValueError(f"MAPPING not found in {xml_path}")
 
@@ -29,33 +43,40 @@ def parse_mapping_xml(xml_path: str) -> str:
     # ------------------------------------------------------------
     # Collect folder-level SOURCE/TARGET definitions
     # ------------------------------------------------------------
-    folder_sources: Dict[str, Dict] = {}  # name -> {fields:[(name,dtype)], db,schema,full}
-    folder_targets: Dict[str, Dict] = {}
-
     def _full(db, schema, name):
-        db = (db or "").upper()
-        schema = (schema or "").upper()
+        db = (db or "").upper(); schema = (schema or "").upper()
         return f"{db}.{schema}.{name}" if db and schema else name
 
+    folder_sources: Dict[str, Dict] = {}
+    folder_targets: Dict[str, Dict] = {}
+
     for s in folder_el.findall("./SOURCE"):
-        sname = s.get("NAME")
+        sname = (s.get("NAME") or "").strip()
         if not sname:
             continue
         fields = [(f.get("NAME"), f.get("DATATYPE") or "") for f in s.findall("./FIELD")]
-        full = _full(s.get("DBDNAME"), s.get("OWNERNAME"), sname)
-        folder_sources[sname] = {"fields": fields, "db": (s.get("DBDNAME") or "").upper(),
-                                 "schema": (s.get("OWNERNAME") or "").upper(),
-                                 "name": sname, "full": full}
+        meta = {
+            "fields": fields,
+            "db": (s.get("DBDNAME") or "").upper(),
+            "schema": (s.get("OWNERNAME") or "").upper(),
+            "name": sname,
+            "full": _full(s.get("DBDNAME"), s.get("OWNERNAME"), sname),
+        }
+        folder_sources[sname.upper()] = meta
 
     for t in folder_el.findall("./TARGET"):
-        tname = t.get("NAME")
+        tname = (t.get("NAME") or "").strip()
         if not tname:
             continue
         fields = [(f.get("NAME"), f.get("DATATYPE") or "") for f in t.findall("./FIELD")]
-        full = _full(t.get("DBDNAME"), t.get("OWNERNAME"), tname)
-        folder_targets[tname] = {"fields": fields, "db": (t.get("DBDNAME") or "").upper(),
-                                 "schema": (t.get("OWNERNAME") or "").upper(),
-                                 "name": tname, "full": full}
+        meta = {
+            "fields": fields,
+            "db": (t.get("DBDNAME") or "").upper(),
+            "schema": (t.get("OWNERNAME") or "").upper(),
+            "name": tname,
+            "full": _full(t.get("DBDNAME"), t.get("OWNERNAME"), tname),
+        }
+        folder_targets[tname.upper()] = meta
 
     # ------------------------------------------------------------
     # Buckets to persist
@@ -74,8 +95,8 @@ def parse_mapping_xml(xml_path: str) -> str:
         instances.append({"instance_id": inst_id, "mapping_id": mapping_id, "type": inst_type, "name": inst_name})
         return inst_id
 
-    def _add_ports_for_source_instance(inst_id: str, src_name: str):
-        meta = folder_sources.get(src_name)
+    def _add_ports_for_source_instance(inst_id: str, src_key: str):
+        meta = folder_sources.get(src_key)
         if not meta:
             return
         for fname, dtype in meta["fields"]:
@@ -86,8 +107,8 @@ def parse_mapping_xml(xml_path: str) -> str:
                          "name": meta["name"], "full_name": meta["full"]})
         map_src.append({"mapping_id": mapping_id, "object_id": obj_id})
 
-    def _add_ports_for_target_instance(inst_id: str, tgt_name: str):
-        meta = folder_targets.get(tgt_name)
+    def _add_ports_for_target_instance(inst_id: str, tgt_key: str):
+        meta = folder_targets.get(tgt_key)
         if not meta:
             return
         for fname, dtype in meta["fields"]:
@@ -99,7 +120,7 @@ def parse_mapping_xml(xml_path: str) -> str:
         map_tgt.append({"mapping_id": mapping_id, "object_id": obj_id})
 
     # ------------------------------------------------------------
-    # TRANSFORMATIONS (same as before) + intra-transform edges
+    # TRANSFORMATIONS (in-mapping) + intra-transform edges
     # ------------------------------------------------------------
     tx_names = set()
     for t in mapping.findall("./TRANSFORMATION"):
@@ -129,7 +150,7 @@ def parse_mapping_xml(xml_path: str) -> str:
             if direction == "OUTPUT":
                 output_defs.append({"name": pname, "expr_text": expr_text})
 
-        # Grab conditions from TABLEATTRIBUTE
+        # Conditions from TABLEATTRIBUTE (join/filter/lookup/group)
         for ta in t.findall("./TABLEATTRIBUTE"):
             aname = (ta.get("NAME") or "").lower()
             aval = ta.get("VALUE") or ""
@@ -174,35 +195,36 @@ def parse_mapping_xml(xml_path: str) -> str:
 
     for inst in mapping.findall("./INSTANCE"):
         iname = inst.get("NAME") or inst.get("INSTANCE_NAME")
-        ttype = (inst.get("TYPE") or inst.get("TRANSFORMATION_TYPE") or "").lower()
-        refname = (inst.get("TRANSFORMATION_NAME") or inst.get("REFOBJECTNAME") or inst.get("REF_OBJECT_NAME") or "")
-
+        rawt = (inst.get("TYPE") or inst.get("TRANSFORMATION_TYPE") or inst.get("TRANSFORMATIONTYPE") or "").lower()
+        refname = (inst.get("TRANSFORMATION_NAME") or inst.get("REFOBJECTNAME") or inst.get("REF_OBJECT_NAME") or iname or "")
         if not iname:
             continue
+        refU = (refname or "").upper()
+        inameU = iname.upper()
 
-        if "source" in ttype:
-            instance_type_by_name[iname] = "Source"
-            instance_refname_by_name[iname] = refname or iname
-        elif "target" in ttype:
+        if ("target" in rawt) or ("target definition" in rawt) or (refU in folder_targets) or (inameU in folder_targets):
             instance_type_by_name[iname] = "Target"
             instance_refname_by_name[iname] = refname or iname
+        elif ("source" in rawt) or ("source definition" in rawt) or (refU in folder_sources) or (inameU in folder_sources):
+            instance_type_by_name[iname] = "Source"
+            instance_refname_by_name[iname] = refname or iname
         else:
-            # treat as transformation instance name (often same as TRANSFORMATION NAME)
             instance_type_by_name[iname] = "Transformation"
 
-    # Create Source/Target instances from INSTANCE bindings
+    # Create Source/Target instances from INSTANCE bindings (skip if same name was a Transformation)
     for iname, itype in instance_type_by_name.items():
-        if itype == "Source" and iname not in tx_names:
+        if iname in tx_names:
+            continue
+        if itype == "Source":
             inst_id = _add_instance(iname, "Source")
-            _add_ports_for_source_instance(inst_id, instance_refname_by_name.get(iname, iname))
-        elif itype == "Target" and iname not in tx_names:
+            key = (instance_refname_by_name.get(iname, iname) or iname).upper()
+            _add_ports_for_source_instance(inst_id, key)
+        elif itype == "Target":
             inst_id = _add_instance(iname, "Target")
-            _add_ports_for_target_instance(inst_id, instance_refname_by_name.get(iname, iname))
+            key = (instance_refname_by_name.get(iname, iname) or iname).upper()
+            _add_ports_for_target_instance(inst_id, key)
 
-    # ------------------------------------------------------------
-    # Fallback: if connectors reference instance names that match folder-level
-    # SOURCE/TARGET, create those instances/ports even without INSTANCE blocks.
-    # ------------------------------------------------------------
+    # Fallback: connectors mention instances not declared in <INSTANCE>
     connector_insts = set()
     for c in mapping.findall("./CONNECTOR"):
         if c.get("FROMINSTANCE"):
@@ -212,13 +234,26 @@ def parse_mapping_xml(xml_path: str) -> str:
 
     existing_insts = {r["name"] for r in instances}
     for iname in connector_insts - existing_insts:
-        if iname in folder_sources:
+        inameU = iname.upper()
+        if inameU in folder_sources:
             inst_id = _add_instance(iname, "Source")
-            _add_ports_for_source_instance(inst_id, iname)
-        elif iname in folder_targets:
+            _add_ports_for_source_instance(inst_id, inameU)
+        elif inameU in folder_targets:
             inst_id = _add_instance(iname, "Target")
-            _add_ports_for_target_instance(inst_id, iname)
-        # else: leave as-is; it should be a transformation already created above
+            _add_ports_for_target_instance(inst_id, inameU)
+        # else: assume it was a transformation already created
+
+    # Safety net: backfill ports for any Source/Target instance that ended up empty
+    have_ports_by_inst = {p["instance_id"] for p in ports}
+    for inst in list(instances):
+        if inst["instance_id"] in have_ports_by_inst:
+            continue
+        if inst["type"] == "Target":
+            key = (instance_refname_by_name.get(inst["name"], inst["name"]) or inst["name"]).upper()
+            _add_ports_for_target_instance(inst["instance_id"], key)
+        elif inst["type"] == "Source":
+            key = (instance_refname_by_name.get(inst["name"], inst["name"]) or inst["name"]).upper()
+            _add_ports_for_source_instance(inst["instance_id"], key)
 
     # ------------------------------------------------------------
     # CONNECTORs (between instances)
