@@ -1,0 +1,10 @@
+[Global]
+$DB2_Schema=SRC
+$TMP_Schema=STG
+$MART_Schema=DW
+
+[m_Load_Claims]
+$CommitInterval=10000
+
+[m_Build_Mart]
+$JoinType=INNER
