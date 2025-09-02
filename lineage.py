@@ -40,6 +40,19 @@ def _mapping_name_by_instance_id(instance_id: str) -> str:
     mapping = st.where("mappings", mapping_id=inst["mapping_id"])
     return mapping[0]["name"] if mapping else ""
 
+def _expr_for_port(port_id: str) -> str:
+    for e in st.all_rows("expressions"):
+        if e.get("kind") == "expr" and e.get("port_id") == port_id:
+            return e.get("raw", "")
+    return ""
+
+def _join_for_instance(instance_id: str) -> str:
+    for e in st.all_rows("expressions"):
+        if e.get("kind") == "join" and str(e.get("port_id","")).startswith(instance_id):
+            return e.get("raw", "")
+    return ""
+
+
 def find_target_ports_by_field(field_like: str) -> List[Dict]:
     # Use ONLY exact case-insensitive match on the target column name.
     # If the user passes a qualified name like FOLDER:MAP:INST:COL or SCHEMA.TABLE.COL,
@@ -107,118 +120,170 @@ def _target_instance_for_physical(mapping_id: str, full_name: str) -> str:
             return obj["name"]
     return ""
 
+
+
 def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
+    """
+    Strict lineage, ordered from target -> upstream.
+    - Start ports come from exact (case-insensitive) field match.
+    - Inside a mapping: only CONNECTOR edges and EXPRESSION-based edges.
+    - Cross-workflow: exact physical object + exact column name.
+    - Returns rows grouped per target ('chain_id'), ordered by 'level' and 'step_no'.
+    """
     edges = st.all_rows("edges")
     ports_idx = st.by_id("ports", "port_id")
     inst_idx  = st.by_id("instances", "instance_id")
     maps_idx  = st.by_id("mappings", "mapping_id")
 
+    def _idnorm(pid: str) -> str:
+        return (pid or "").lower()
+
+    # to_port -> [from_port...]
     to_index: Dict[str, List[str]] = {}
     for e in edges:
         to_index.setdefault(_idnorm(e["to_port_id"]), []).append(e["from_port_id"])
 
-    starts = find_target_ports_by_field(field)
-    results: List[Dict] = []
-    hop = 0
-
+    # physical target map: full_name -> [mapping names]
     phys = st.by_id("physical_objects", "object_id")
     tgt_map_by_full = {}
     for mt in st.all_rows("map_targets"):
         full = phys[mt["object_id"]]["full_name"]
         tgt_map_by_full.setdefault(full, []).append(maps_idx[mt["mapping_id"]]["name"])
 
-    visited_ports = set()
-    visited_cross = set()
-
-    dq = deque(p["port_id"] for p in starts)
-
-    while dq and len(results) < max_rows:
-        cur = dq.popleft()
-        if cur in visited_ports:
-            continue
-        visited_ports.add(cur)
-
-        for up in to_index.get(_idnorm(cur), []):
-            fp = ports_idx.get(up); tp = ports_idx.get(cur)
-            if not fp or not tp:
+    def _target_instance_for_physical(mapping_id: str, full_name: str) -> str:
+        for mt in st.all_rows("map_targets"):
+            if mt["mapping_id"] != mapping_id:
                 continue
-            fi = inst_idx.get(fp["instance_id"]); ti = inst_idx.get(tp["instance_id"])
-            if not fi or not ti:
-                continue
+            obj = phys.get(mt["object_id"])
+            if obj and obj["full_name"] == full_name:
+                return obj["name"]
+        return ""
 
-            hop += 1
-            extras = attach_expr_and_join(up, fi["instance_id"])
-            results.append({
-                "hop_no": hop,
-                "mapping": maps_idx[ti["mapping_id"]]["name"],
-                "from_instance": fi["name"], "from_port": fp["name"], "from_type": fi["type"],
-                "to_instance": ti["name"],  "to_port":  tp["name"],  "to_type":  ti["type"],
-                "operation": "compute" if extras["expression"] else "passthrough",
-                "expression": extras["expression"],
-                "join_condition": extras["join_condition"],
-                "stage": "mapping",
-                "evidence": f"{up}->{cur}"
-            })
+    starts = find_target_ports_by_field(field)  # exact-only, already implemented
 
-            # If the upstream instance is a Source, consider cross-workflow stitch
-            if fi["type"].lower() != "source":
-                dq.append(up)
-                continue
+    all_rows: List[Dict] = []
+    chain_id = 0
 
-            src_inst_name = fi["name"]
-            src_map_id = fi["mapping_id"]
+    for start in starts:
+        chain_id += 1
+        start_pid = start["port_id"]
 
-            # resolve full physical name of this source instance in its mapping
-            full = ""
-            for ms in st.all_rows("map_sources"):
-                if ms["mapping_id"] != src_map_id:
+        dist = { start_pid: 0 }           # port_id -> hops from target
+        visited_ports = { start_pid }
+        visited_cross = set()
+        dq = deque([start_pid])
+
+        chain_rows: List[Dict] = []
+
+        while dq and len(all_rows) + len(chain_rows) < max_rows:
+            cur = dq.popleft()
+
+            # upstream edges inside the same mapping
+            ups = to_index.get(_idnorm(cur), [])
+            for up in ups:
+                fp = ports_idx.get(up); tp = ports_idx.get(cur)
+                if not fp or not tp:
                     continue
-                obj = st.by_id("physical_objects", "object_id").get(ms["object_id"])
-                if obj and obj["name"] == src_inst_name:
-                    full = obj["full_name"]; break
-            if not full:
-                continue
-
-            # mappings that have this as TARGET (exact)
-            candidate_map_names = tgt_map_by_full.get(full, [])
-            if not candidate_map_names:
-                continue
-
-            exact_col = (fp["name"] or "").lower()
-            for upstream_map_name in candidate_map_names:
-                upstream_map_id = next((mid for mid, m in maps_idx.items() if m["name"] == upstream_map_name), "")
-                if not upstream_map_id:
-                    continue
-                tgt_inst_name = _target_instance_for_physical(upstream_map_id, full)
-                if not tgt_inst_name:
+                fi = inst_idx.get(fp["instance_id"]); ti = inst_idx.get(tp["instance_id"])
+                if not fi or not ti:
                     continue
 
-                # exact column name on that target's INPUT
-                candidate_ports = [p for p in ports_idx.values()
-                    if p["instance_id"] == f"{upstream_map_id}:{tgt_inst_name}" and p["direction"] == "INPUT"]
-                match_port = next((p for p in candidate_ports if (p["name"] or "").lower() == exact_col), None)
-                if not match_port:
-                    continue
+                level = dist[cur] + 1
 
-                # prevent cross cycles
-                key = (full, upstream_map_name, fp["name"])
-                if key in visited_cross:
-                    continue
-                visited_cross.add(key)
+                # Expression: prefer the OUTPUT side (cur), else FROM side (up)
+                expr_cur = _expr_for_port(cur)
+                expr_up  = _expr_for_port(up)
+                expr_raw = expr_cur or expr_up
+                expr_owner_inst = ti["instance_id"] if expr_cur else fi["instance_id"]
+                join_cond = _join_for_instance(expr_owner_inst)
 
-                hop += 1
-                results.append({
-                    "hop_no": hop,
-                    "mapping": f"{maps_idx[src_map_id]['name']} -> {upstream_map_name}",
-                    "from_instance": "(TARGET)", "from_port": match_port["name"], "from_type": "Target",
-                    "to_instance": "(SOURCE)",  "to_port":   fp["name"],         "to_type":  "Source",
-                    "operation": "cross_workflow (exact)",
-                    "expression": "", "join_condition": "",
-                    "stage": "cross_workflow",
-                    "evidence": full
+                chain_rows.append({
+                    "chain_id": chain_id,
+                    "level": level,
+                    "mapping": maps_idx[ti["mapping_id"]]["name"],
+                    "from_instance": fi["name"], "from_port": fp["name"], "from_type": fi["type"],
+                    "to_instance": ti["name"],  "to_port":  tp["name"],  "to_type":  ti["type"],
+                    "operation": "compute" if expr_raw else "passthrough",
+                    "expression": expr_raw,
+                    "join_condition": join_cond,
+                    "stage": "mapping",
+                    "evidence": f"{up}->{cur}",
                 })
 
-                next_pid = f"{upstream_map_id}:{tgt_inst_name}:{match_port['name']}"
-                dq.append(next_pid)
+                if up not in visited_ports:
+                    visited_ports.add(up)
+                    dist[up] = level
+                    dq.append(up)
 
-    return results
+                # Strict cross-workflow: only when FROM instance is a Source
+                if fi["type"].lower() == "source":
+                    src_inst_name = fi["name"]
+                    src_map_id = fi["mapping_id"]
+
+                    # physical full name for this source instance
+                    full = ""
+                    for ms in st.all_rows("map_sources"):
+                        if ms["mapping_id"] != src_map_id:
+                            continue
+                        obj = st.by_id("physical_objects", "object_id").get(ms["object_id"])
+                        if obj and obj["name"] == src_inst_name:
+                            full = obj["full_name"]; break
+                    if not full:
+                        continue
+
+                    # all mappings whose TARGET physical matches exactly
+                    candidate_map_names = tgt_map_by_full.get(full, [])
+                    if not candidate_map_names:
+                        continue
+
+                    exact_col = (fp["name"] or "").lower()
+                    for upstream_map_name in candidate_map_names:
+                        upstream_map_id = next((mid for mid, m in maps_idx.items()
+                                                if m["name"] == upstream_map_name), "")
+                        if not upstream_map_id:
+                            continue
+                        tgt_inst_name = _target_instance_for_physical(upstream_map_id, full)
+                        if not tgt_inst_name:
+                            continue
+
+                        # exact column on that target's INPUT
+                        candidate_ports = [p for p in ports_idx.values()
+                            if p["instance_id"] == f"{upstream_map_id}:{tgt_inst_name}" and p["direction"] == "INPUT"]
+                        match_port = next((p for p in candidate_ports
+                                           if (p["name"] or "").lower() == exact_col), None)
+                        if not match_port:
+                            continue
+
+                        cross_key = (full, upstream_map_name, fp["name"])
+                        if cross_key in visited_cross:
+                            continue
+                        visited_cross.add(cross_key)
+
+                        level_x = level  # cross step sits between levels
+                        chain_rows.append({
+                            "chain_id": chain_id,
+                            "level": level_x,
+                            "mapping": f"{maps_idx[src_map_id]['name']} -> {upstream_map_name}",
+                            "from_instance": "(TARGET)", "from_port": match_port["name"], "from_type": "Target",
+                            "to_instance": "(SOURCE)",  "to_port":   fp["name"],         "to_type":  "Source",
+                            "operation": "cross_workflow (exact)",
+                            "expression": "", "join_condition": "",
+                            "stage": "cross_workflow",
+                            "evidence": full,
+                        })
+
+                        next_pid = f"{upstream_map_id}:{tgt_inst_name}:{match_port['name']}"
+                        if next_pid not in visited_ports:
+                            visited_ports.add(next_pid)
+                            dist[next_pid] = level_x   # next mapping edges will be level_x+1
+                            dq.append(next_pid)
+
+        # per-chain ordering and step numbering
+        chain_rows.sort(key=lambda r: (r["level"], r["stage"], r["mapping"], r["from_instance"], r["from_port"]))
+        for i, row in enumerate(chain_rows, start=1):
+            row["step_no"] = i
+        all_rows.extend(chain_rows)
+
+    # global stable order across chains
+    all_rows.sort(key=lambda r: (r["chain_id"], r["step_no"]))
+    return all_rows

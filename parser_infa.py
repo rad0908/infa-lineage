@@ -177,15 +177,19 @@ def parse_mapping_xml(xml_path: str) -> str:
         tx_names.add(t_name)
         inst_id = _add_instance(t_name, t_type or "Transformation")
 
+        # ── collect ports and capture OUTPUT expressions exactly as in XML ──
         input_names: List[str] = []
         var_names:   List[str] = []
         outputs:     List[Dict] = []
 
         for pf in t.findall("./TRANSFORMFIELD"):
             pname = pf.get("NAME")
+            if not pname:
+                continue
             pdir  = (pf.get("PORTTYPE") or "").upper()
             dtype = pf.get("DATATYPE") or ""
             pid   = _id(inst_id, pname)
+
             direction = pdir if pdir in ("INPUT", "OUTPUT", "VARIABLE") else "VARIABLE"
             ports.append({
                 "port_id": pid,
@@ -195,10 +199,23 @@ def parse_mapping_xml(xml_path: str) -> str:
                 "direction": direction,
             })
 
-            expr_text = pf.get("EXPRESSION") or pf.get("EXPR") or ""
-            if expr_text:
-                exprs.append({"port_id": pid, "kind": "expr", "raw": expr_text, "meta": None})
+            # The actual formula lives in EXPRESSION (some exports use a child tag)
+            expr_text = (pf.get("EXPRESSION")
+                        or pf.findtext("./EXPRESSION")
+                        or pf.findtext("./EXPR")
+                        or "")
+            expr_name = (pf.get("EXPRESSIONNAME") or pf.get("EXPRESSION_NAME") or "")
 
+            # Record the expression ONLY for OUTPUT ports
+            if expr_text and direction == "OUTPUT":
+                exprs.append({
+                    "port_id": pid,     # attach to the OUTPUT port id
+                    "kind":   "expr",
+                    "raw":    expr_text,   # the formula
+                    "meta":   expr_name,   # optional label/name if present
+                })
+
+            # bucket names for strict dependency wiring
             if direction == "INPUT":
                 input_names.append(pname)
             elif direction == "VARIABLE":
@@ -206,17 +223,17 @@ def parse_mapping_xml(xml_path: str) -> str:
             elif direction == "OUTPUT":
                 outputs.append({"name": pname, "expr_text": expr_text})
 
+        # ── STRICT intra-transform edges: only tokens referenced in EXPRESSION ──
         inputs_ci = {n.lower(): n for n in input_names}
         vars_ci   = {n.lower(): n for n in var_names}
 
-        # STRICT: wire only explicit references found in EXPRESSION
         for od in outputs:
             out_name = od["name"]
-            out_pid  = _id(inst_id, out_name)
             expr_txt = od["expr_text"] or ""
             if not expr_txt:
-                # No expression => do not infer any dependency edges
+                # No expression → do NOT infer any dependencies
                 continue
+
             tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr_txt)
             refs: List[str] = []
             for tok in tokens:
@@ -225,6 +242,8 @@ def parse_mapping_xml(xml_path: str) -> str:
                     refs.append(inputs_ci[tci])
                 elif tci in vars_ci:
                     refs.append(vars_ci[tci])
+
+            out_pid = _id(inst_id, out_name)
             for in_name in refs:
                 in_pid = _id(inst_id, in_name)
                 if in_pid != out_pid:
