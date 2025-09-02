@@ -1,91 +1,66 @@
+
 <!doctype html>
 <html>
-<head>
-  <meta charset="utf-8"/>
-  <title>Informatica Lineage Lookup</title>
-  <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
-    input[type=text] { padding: 8px; width: 280px; }
-    button { padding: 8px 12px; margin-left: 8px; }
-    table { border-collapse: collapse; width: 100%; margin-top: 16px; font-size: 14px; }
-    th, td { border: 1px solid #ddd; padding: 6px 8px; }
-    th { background: #f3f3f3; position: sticky; top: 0; }
-    .row { margin: 8px 0; }
-    .muted { color: #666; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <h2>Informatica Lineage Lookup</h2>
-  <div class="muted">Mappings are auto-loaded from the project folder on server startup.</div>
-
-  <div class="row">
-    <label>Target field/column:</label>
-    <input id="field" type="text" placeholder="NET_AMT"/>
-    <button onclick="doLookup()">Lookup</button>
-    <button onclick="downloadCSV()">Download CSV</button>
-  </div>
-
-  <div id="table"></div>
-
-<script>
-let lastRows = [];
-
-async function doLookup() {
-  const f = document.getElementById("field").value.trim();
-  if (!f) { alert("Enter a target field/column name"); return; }
-  const resp = await fetch(`/api/lookup?field=${encodeURIComponent(f)}`);
-  const rows = await resp.json();
-  lastRows = rows;
-  render(rows);
-}
-
-function render(rows) {
-  const cols = ["hop_no","mapping","from_instance","from_port","from_type",
-                "to_instance","to_port","to_type","operation","expression",
-                "join_condition","stage","evidence"];
-  let html = "<table><thead><tr>";
-  cols.forEach(c => html += `<th>${c}</th>`);
-  html += "</tr></thead><tbody>";
-  if (!rows.length) {
-    html += `<tr><td colspan="${cols.length}">No results.</td></tr>`;
-  } else {
-    for (const r of rows) {
-      html += "<tr>";
-      cols.forEach(c => html += `<td>${escapeHtml(r[c] ?? "")}</td>`);
-      html += "</tr>";
-    }
-  }
-  html += "</tbody></table>";
-  document.getElementById("table").innerHTML = html;
-}
-
-function downloadCSV() {
-  if (!lastRows.length) { alert("Nothing to download. Run a lookup first."); return; }
-  const cols = ["hop_no","mapping","from_instance","from_port","from_type",
-                "to_instance","to_port","to_type","operation","expression",
-                "join_condition","stage","evidence"];
-  let csv = cols.join(",") + "\n";
-  for (const r of lastRows) {
-    const row = cols.map(c => csvEscape(r[c] ?? "")).join(",");
-    csv += row + "\n";
-  }
-  const blob = new Blob([csv], {type: "text/csv;charset=utf-8;"});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = "lineage.csv";
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-function csvEscape(v) {
-  const s = String(v).replace(/"/g,'""');
-  return `"${s}"`;
-}
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, m => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
-  }[m]));
-}
-</script>
-</body>
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Informatica Lineage Lookup</title>
+    <style>
+      body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+      input, button { font-size: 16px; padding: 8px 12px; }
+      table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+      th, td { border: 1px solid #ddd; padding: 8px; font-size: 14px; }
+      th { background: #f3f3f3; position: sticky; top: 0; }
+      .rowcount { margin-top: 8px; color: #555; }
+      .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>Informatica Lineage Lookup</h1>
+    <div class="controls">
+      <input id="field" placeholder="Search field e.g. OUTSTANDING_BAL" style="min-width: 320px;">
+      <button onclick="lookup()">Lookup</button>
+      <button onclick="resetLoad()">Reload XMLs</button>
+    </div>
+    <div class="rowcount" id="status"></div>
+    <table id="results">
+      <thead>
+        <tr>
+          <th>#</th><th>Mapping</th><th>From Instance</th><th>From Port</th><th>To Instance</th><th>To Port</th>
+          <th>Operation</th><th>Expression</th><th>Join</th><th>Stage</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <script>
+      async function lookup() {
+        const q = document.getElementById('field').value || '';
+        const res = await fetch(`/api/lookup?field=${encodeURIComponent(q)}`);
+        const rows = await res.json();
+        const tbody = document.querySelector('#results tbody');
+        tbody.innerHTML = '';
+        for (const r of rows) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${r.hop_no ?? ""}</td>
+            <td>${r.mapping ?? ""}</td>
+            <td>${r.from_instance ?? ""}</td>
+            <td>${r.from_port ?? ""}</td>
+            <td>${r.to_instance ?? ""}</td>
+            <td>${r.to_port ?? ""}</td>
+            <td>${r.operation ?? ""}</td>
+            <td>${r.expression ?? ""}</td>
+            <td>${r.join_condition ?? ""}</td>
+            <td>${r.stage ?? ""}</td>`;
+          tbody.appendChild(tr);
+        }
+        document.getElementById('status').textContent = `${rows.length} row(s)`;
+      }
+      async function resetLoad() {
+        const res = await fetch('/api/reset', {method:'POST'});
+        const info = await res.json();
+        document.getElementById('status').textContent = `Reloaded ${info.files} XML file(s) from ${info.dir}`;
+      }
+    </script>
+  </body>
 </html>

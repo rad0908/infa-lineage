@@ -1,12 +1,16 @@
+
 from collections import deque
 from difflib import SequenceMatcher
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import storage as st
 
 def _norm(s: str) -> str:
     return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
-def _best_name_match(name: str, candidates: List[str], threshold: float = 0.82) -> tuple[str, float]:
+def _idnorm(pid: str) -> str:
+    return (pid or "").lower()
+
+def _best_name_match(name: str, candidates: List[str], threshold: float = 0.82) -> Tuple[str, float]:
     if not candidates:
         return ("", 0.0)
     n = _norm(name)
@@ -35,35 +39,34 @@ def _mapping_name_by_instance_id(instance_id: str) -> str:
 
 def find_target_ports_by_field(field_like: str) -> List[Dict]:
     field_like = (field_like or "").lower().replace("_", "")
-    out = []
+    out_pref = []
+    out_fallback = []
 
     ports = st.all_rows("ports")
-    insts = st.by_id("instances", "instance_id")
+    insts = _index_instances()
     edges = st.all_rows("edges")
-    has_out = {e["from_port_id"] for e in edges}  # anything with outbound edge is not a sink
+    has_out = {e["from_port_id"] for e in edges}
+    has_in = {e["to_port_id"] for e in edges}
 
     for p in ports:
         inst = insts.get(p["instance_id"])
         if not inst:
             continue
-
-        # target-ish if labeled Target OR it's an INPUT port with no outbound edges (graph sink)
         is_targetish = (inst.get("type") == "Target") or (p["direction"] == "INPUT" and p["port_id"] not in has_out)
         if not is_targetish:
             continue
-
         norm = p["name"].lower().replace("_", "")
         if field_like in norm:
-            out.append({
+            row = {
                 "port_id": p["port_id"],
                 "instance_id": p["instance_id"],
                 "port_name": p["name"],
                 "instance_name": inst["name"],
-                "mapping_name": next((m["name"] for m in st.all_rows("mappings")
-                                      if m["mapping_id"] == inst["mapping_id"]), "")
-            })
-    return out
+                "mapping_name": _mapping_name_by_instance_id(p["instance_id"]).strip()
+            }
+            (out_pref if p["port_id"] in has_in else out_fallback).append(row)
 
+    return out_pref or out_fallback
 
 def attach_expr_and_join(from_port_id: str, from_instance_id: str) -> Dict[str, str]:
     exprs = [e for e in st.all_rows("expressions") if e["port_id"] == from_port_id and e["kind"] == "expr"]
@@ -71,15 +74,6 @@ def attach_expr_and_join(from_port_id: str, from_instance_id: str) -> Dict[str, 
     joiners = [e for e in st.all_rows("expressions") if e["kind"] == "join" and e["port_id"].startswith(from_instance_id)]
     join_cond = joiners[0]["raw"] if joiners else ""
     return {"expression": expr, "join_condition": join_cond}
-
-def _physical_full_for_source_instance(mapping_id: str, source_inst_name: str) -> str:
-    for ms in st.all_rows("map_sources"):
-        if ms["mapping_id"] != mapping_id:
-            continue
-        obj = st.by_id("physical_objects", "object_id").get(ms["object_id"])
-        if obj and obj["name"] == source_inst_name:
-            return obj["full_name"]
-    return ""
 
 def _target_instance_for_physical(mapping_id: str, full_name: str) -> str:
     phys = st.by_id("physical_objects", "object_id")
@@ -91,42 +85,15 @@ def _target_instance_for_physical(mapping_id: str, full_name: str) -> str:
             return obj["name"]
     return ""
 
-def build_crosslinks_deterministic() -> int:
-    map_targets = st.all_rows("map_targets")
-    map_sources = st.all_rows("map_sources")
-    phys = st.by_id("physical_objects", "object_id")
-    mappings = st.by_id("mappings", "mapping_id")
-
-    tgt_by_full = {}
-    for mt in map_targets:
-        full = phys[mt["object_id"]]["full_name"]
-        tgt_by_full.setdefault(full, []).append(mappings[mt["mapping_id"]]["name"])
-
-    src_by_full = {}
-    for ms in map_sources:
-        full = phys[ms["object_id"]]["full_name"]
-        src_by_full.setdefault(full, []).append(mappings[ms["mapping_id"]]["name"])
-
-    rows = []
-    for full, from_maps in tgt_by_full.items():
-        for fm in from_maps:
-            for tm in src_by_full.get(full, []):
-                if fm != tm:
-                    rows.append({"from_mapping": fm, "to_mapping": tm, "object_name": full})
-
-    st.insert_if_missing("crosslinks", rows, ("from_mapping", "to_mapping", "object_name"))
-    return len(rows)
-
-
 def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
     edges = st.all_rows("edges")
     ports_idx = st.by_id("ports", "port_id")
     inst_idx  = st.by_id("instances", "instance_id")
     maps_idx  = st.by_id("mappings", "mapping_id")
 
-    to_index = {}
+    to_index: Dict[str, List[str]] = {}
     for e in edges:
-        to_index.setdefault(e["to_port_id"], []).append(e["from_port_id"])
+        to_index.setdefault(_idnorm(e["to_port_id"]), []).append(e["from_port_id"])
 
     starts = find_target_ports_by_field(field)
     results: List[Dict] = []
@@ -141,7 +108,6 @@ def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
     visited_ports = set()
     visited_cross = set()
 
-    from collections import deque
     dq = deque(p["port_id"] for p in starts)
 
     while dq and len(results) < max_rows:
@@ -150,7 +116,7 @@ def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
             continue
         visited_ports.add(cur)
 
-        for up in to_index.get(cur, []):
+        for up in to_index.get(_idnorm(cur), []):
             fp = ports_idx.get(up); tp = ports_idx.get(cur)
             if not fp or not tp:
                 continue
@@ -183,8 +149,7 @@ def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
                         continue
                     obj = st.by_id("physical_objects", "object_id").get(ms["object_id"])
                     if obj and obj["name"] == src_inst_name:
-                        full = obj["full_name"]
-                        break
+                        full = obj["full_name"]; break
                 if not full:
                     continue
 
@@ -201,21 +166,20 @@ def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
                         if p["instance_id"] == f"{upstream_map_id}:{tgt_inst_name}" and p["direction"] == "INPUT"]
                     candidate_names = [p["name"] for p in candidate_ports]
 
-                    best_name, score = "", 0.0
-                    if candidate_names:
-                        n = _norm(fp["name"])
+                    # exact/normalized match first, then fuzzy
+                    best_name = ""; score = 0.0
+                    n = _norm(fp["name"])
+                    for c in candidate_names:
+                        if _norm(c) == n:
+                            best_name, score = c, 1.0
+                            break
+                    if not best_name:
                         for c in candidate_names:
-                            if _norm(c) == n:
-                                best_name, score = c, 1.0
-                                break
-                        if not best_name:
-                            best, sc = "", 0.0
-                            for c in candidate_names:
-                                s = SequenceMatcher(None, n, _norm(c)).ratio()
-                                if s > sc:
-                                    best, sc = c, s
-                            if sc >= 0.82:
-                                best_name, score = best, sc
+                            s = SequenceMatcher(None, n, _norm(c)).ratio()
+                            if s > score:
+                                best_name, score = c, s
+                        if score < 0.82:
+                            best_name = ""
 
                     next_pid = f"{upstream_map_id}:{tgt_inst_name}:{best_name}" if best_name else ""
 
