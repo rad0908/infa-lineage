@@ -206,7 +206,7 @@ def parse_mapping_xml(xml_path: str) -> str:
                          or "")
             expr_name = (pf.get("EXPRESSIONNAME") or pf.get("EXPRESSION_NAME") or "")
 
-            if expr_text and direction == "OUTPUT":
+            if expr_text and direction in ("OUTPUT", "VARIABLE"):
                 exprs.append({
                     "port_id": pid,   # attach to OUTPUT port
                     "kind":   "expr",

@@ -3,9 +3,30 @@ from collections import deque
 from difflib import SequenceMatcher
 from typing import List, Dict, Tuple
 import storage as st
+import re
 
 CROSSWORKFLOW_EXACT_ONLY = True
 REQUIRE_UNIQUE_UPSTREAM = True
+
+_IDENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+def _resolved_expr_for_edge(up_pid: str, cur_pid: str, ports_idx: dict) -> str:
+    """
+    Prefer the OUTPUT expression unless it is a simple alias (single identifier)
+    pointing to the upstream port name; in that case show the upstream port's formula.
+    Falls back to upstream expr if OUTPUT has none.
+    """
+    cur_expr = _expr_for_port(cur_pid)
+    if cur_expr:
+        token = cur_expr.strip()
+        if _IDENT.match(token):
+            up = ports_idx.get(up_pid)
+            if up and token.lower() == (up.get("name","").lower()):
+                # OUTPUT just references the VAR; show the VAR's actual formula
+                return _expr_for_port(up_pid) or cur_expr
+        return cur_expr
+    # no OUTPUT expr -> maybe the VAR/input carries the formula
+    return _expr_for_port(up_pid)
 
 def _norm(s: str) -> str:
     return "".join(ch for ch in (s or "").lower() if ch.isalnum())
@@ -193,8 +214,8 @@ def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
                 # Expression: prefer the OUTPUT side (cur), else FROM side (up)
                 expr_cur = _expr_for_port(cur)
                 expr_up  = _expr_for_port(up)
-                expr_raw = expr_cur or expr_up
-                expr_owner_inst = ti["instance_id"] if expr_cur else fi["instance_id"]
+                expr_raw = _resolved_expr_for_edge(up, cur, ports_idx)
+                expr_owner_inst = ti["instance_id"] if _expr_for_port(cur) else fi["instance_id"]
                 join_cond = _join_for_instance(expr_owner_inst)
 
                 chain_rows.append({
