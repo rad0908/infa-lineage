@@ -45,12 +45,15 @@ def parse_mapping_xml(xml_path: str) -> str:
 
     Assumptions/guarantees:
     - SOURCE/TARGET live under <FOLDER>. MAPPING references them via <INSTANCE>.
-    - INSTANCE typing is based strictly on TYPE/TRANSFORMATION_TYPE or referenced folder object name.
+    - INSTANCE typing is based strictly on TYPE/TRANSFORMATION_TYPE (or TRANSFORMATIONTYPE)
+      and the referenced folder object name (TRANSFORMATION_NAME / REFOBJECTNAME...).
     - TRANSFORMATION edges are added ONLY from explicit EXPRESSION token references.
       If an OUTPUT has no EXPRESSION, we DO NOT infer any edges.
     - CONNECTOR edges are created ONLY from the XML using FROM*/TO* attributes
       (supports FROMPORT/TOFIELD variants). No synthetic/backfill edges.
     - No fuzzy/substring name logic anywhere.
+
+    Note: This reads the FIRST <MAPPING> in the file.
     """
     tree = ET.parse(xml_path)
     root = tree.getroot()
@@ -59,8 +62,6 @@ def parse_mapping_xml(xml_path: str) -> str:
     if folder_el is None:
         raise ValueError(f"FOLDER not found in {xml_path}")
 
-    # Pick the first MAPPING in this file (one per file is typical);
-    # extend if you need multi-mapping per file.
     mapping = folder_el.find("./MAPPING") or root.find(".//MAPPING")
     if mapping is None:
         raise ValueError(f"MAPPING not found in {xml_path}")
@@ -177,7 +178,6 @@ def parse_mapping_xml(xml_path: str) -> str:
         tx_names.add(t_name)
         inst_id = _add_instance(t_name, t_type or "Transformation")
 
-        # ── collect ports and capture OUTPUT expressions exactly as in XML ──
         input_names: List[str] = []
         var_names:   List[str] = []
         outputs:     List[Dict] = []
@@ -199,23 +199,21 @@ def parse_mapping_xml(xml_path: str) -> str:
                 "direction": direction,
             })
 
-            # The actual formula lives in EXPRESSION (some exports use a child tag)
+            # Capture actual formula from EXPRESSION (attribute or child tag)
             expr_text = (pf.get("EXPRESSION")
-                        or pf.findtext("./EXPRESSION")
-                        or pf.findtext("./EXPR")
-                        or "")
+                         or pf.findtext("./EXPRESSION")
+                         or pf.findtext("./EXPR")
+                         or "")
             expr_name = (pf.get("EXPRESSIONNAME") or pf.get("EXPRESSION_NAME") or "")
 
-            # Record the expression ONLY for OUTPUT ports
             if expr_text and direction == "OUTPUT":
                 exprs.append({
-                    "port_id": pid,     # attach to the OUTPUT port id
+                    "port_id": pid,   # attach to OUTPUT port
                     "kind":   "expr",
-                    "raw":    expr_text,   # the formula
-                    "meta":   expr_name,   # optional label/name if present
+                    "raw":    expr_text,
+                    "meta":   expr_name,
                 })
 
-            # bucket names for strict dependency wiring
             if direction == "INPUT":
                 input_names.append(pname)
             elif direction == "VARIABLE":
@@ -223,17 +221,31 @@ def parse_mapping_xml(xml_path: str) -> str:
             elif direction == "OUTPUT":
                 outputs.append({"name": pname, "expr_text": expr_text})
 
-        # ── STRICT intra-transform edges: only tokens referenced in EXPRESSION ──
+        # Record join/filter text for display (metadata only; no edges)
+        for ta in t.findall("./TABLEATTRIBUTE"):
+            aname = (ta.get("NAME") or "").lower()
+            aval  = ta.get("VALUE") or ""
+            if not aval:
+                continue
+            if "join" in aname or aname in ("join condition", "joiner condition"):
+                exprs.append({
+                    "port_id": _id(inst_id, "__join__"),
+                    "kind": "join",
+                    "raw": aval,
+                    "meta": aname,
+                })
+            # If needed you can also record filters similarly.
+
         inputs_ci = {n.lower(): n for n in input_names}
         vars_ci   = {n.lower(): n for n in var_names}
 
+        # STRICT: wire only explicit references found in EXPRESSION
         for od in outputs:
             out_name = od["name"]
+            out_pid  = _id(inst_id, out_name)
             expr_txt = od["expr_text"] or ""
             if not expr_txt:
-                # No expression → do NOT infer any dependencies
-                continue
-
+                continue  # do not infer when expression is blank
             tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr_txt)
             refs: List[str] = []
             for tok in tokens:
@@ -242,14 +254,12 @@ def parse_mapping_xml(xml_path: str) -> str:
                     refs.append(inputs_ci[tci])
                 elif tci in vars_ci:
                     refs.append(vars_ci[tci])
-
-            out_pid = _id(inst_id, out_name)
             for in_name in refs:
                 in_pid = _id(inst_id, in_name)
                 if in_pid != out_pid:
                     edges.append({"from_port_id": in_pid, "to_port_id": out_pid})
 
-    # ---- INSTANCE binding (STRICT; no name heuristics, no backfill)
+    # ---- INSTANCE binding (STRICT; no name heuristics)
     instance_type_by_name: Dict[str, str] = {}
     instance_refname_by_name: Dict[str, str] = {}
 
@@ -272,6 +282,17 @@ def parse_mapping_xml(xml_path: str) -> str:
             instance_type_by_name[iname] = "Transformation"
         instance_refname_by_name[iname] = refname
 
+        # Record Source Qualifier association (metadata only)
+        if rawt == "source qualifier":
+            assoc = _aget(inst, "ASSOCIATED_SOURCE_INSTANCE", "ASSOCIATEDSOURCEINSTANCE")
+            if assoc:
+                exprs.append({
+                    "port_id": _id(_id(mapping_id, iname), "__associated_source__"),
+                    "kind": "assoc_source",
+                    "raw": assoc,
+                    "meta": "ASSOCIATED_SOURCE_INSTANCE",
+                })
+
     # materialize non-TRANSFORMATION instances and their ports for Source/Target
     for iname, itype in instance_type_by_name.items():
         if iname in tx_names:
@@ -285,18 +306,6 @@ def parse_mapping_xml(xml_path: str) -> str:
             key = (instance_refname_by_name.get(iname, "") or "").upper()
             if key:
                 _add_ports_for_target_instance(inst_id, key)
-
-        # Record Source Qualifier association (metadata only, no edges)
-        ttype = (_aget(mapping.find(f".//INSTANCE[@NAME='{iname}']"), "TRANSFORMATION_TYPE", "TRANSFORMATIONTYPE") or "").strip()
-        if ttype.lower() == "source qualifier":
-            assoc = _aget(mapping.find(f".//INSTANCE[@NAME='{iname}']"), "ASSOCIATED_SOURCE_INSTANCE", "ASSOCIATEDSOURCEINSTANCE")
-            if assoc:
-                exprs.append({
-                    "port_id": _id(inst_id, "__associated_source__"),
-                    "kind": "assoc_source",
-                    "raw": assoc,
-                    "meta": "ASSOCIATED_SOURCE_INSTANCE",
-                })
 
     # ---- CONNECTOR edges (STRICT; accept FROMFIELD/TOFIELD variants)
     for c in mapping.findall(".//CONNECTOR"):
@@ -315,7 +324,7 @@ def parse_mapping_xml(xml_path: str) -> str:
     st.insert_if_missing("instances", instances, ("instance_id",))
     st.insert_if_missing("ports", ports, ("port_id",))
     st.insert_if_missing("edges", edges, ("from_port_id", "to_port_id"))
-    st.insert_if_missing("expressions", exprs, ("port_id", "kind"))
+    st.insert_if_missing("expressions", exprs, ("port_id", "kind", "raw"))
     st.insert_if_missing("physical_objects", phys_src + phys_tgt, ("object_id",))
     st.insert_if_missing("map_sources", map_src, ("mapping_id", "object_id"))
     st.insert_if_missing("map_targets", map_tgt, ("mapping_id", "object_id"))
