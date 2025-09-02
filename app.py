@@ -5,6 +5,10 @@ import storage as st
 from parser_infa import parse_mapping_xml
 from lineage import upstream_lineage_multi
 
+
+PRELOAD_ON_START   = os.getenv("PRELOAD_ON_START", "0") == "1"  # default: skip preload
+AUTO_LOAD_IF_EMPTY = os.getenv("AUTO_LOAD_IF_EMPTY", "1") == "1"  # default: lazy-load on first lookup
+
 # Resolve mappings directory: env var takes precedence, else ./samples next to this file
 _env_dir = os.environ.get("MAPPINGS_DIR")
 MAPPINGS_DIR = Path(_env_dir) if _env_dir and _env_dir.strip() else Path(__file__).resolve().parent / "samples"
@@ -35,7 +39,16 @@ def load_all_mappings_from_dir():
 
 
 # Load once on startup
-LOAD_INFO = load_all_mappings_from_dir()
+if PRELOAD_ON_START:
+    LOAD_INFO = load_all_mappings_from_dir()
+else:
+    LOAD_INFO = {
+        "dir": str(MAPPINGS_DIR.resolve()),
+        "files": 0,
+        "loaded": [],
+        "errors": [],
+        "skipped": True
+    }
 
 
 @app.route("/")
@@ -49,6 +62,8 @@ def health():
         "ok": True,
         "mappings_dir": str(MAPPINGS_DIR.resolve()),
         "loaded_files": LOAD_INFO.get("files", 0),
+        "preloaded": PRELOAD_ON_START,
+        "skipped": LOAD_INFO.get("skipped", False),
         "errors": LOAD_INFO.get("errors", []),
     }
 
@@ -63,6 +78,10 @@ def reset():
 @app.route("/api/lookup")
 def lookup():
     field = request.args.get("field", "")
+    # One-time lazy load when first lookup happens (if nothing is loaded yet)
+    if AUTO_LOAD_IF_EMPTY and not st.all_rows("mappings"):
+        global LOAD_INFO
+        LOAD_INFO = load_all_mappings_from_dir()
     rows = upstream_lineage_multi(field)
     return jsonify(rows)
 

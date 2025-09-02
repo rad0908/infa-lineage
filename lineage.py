@@ -163,58 +163,45 @@ def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
             # If the upstream instance is a Source, consider cross-workflow stitch
             if fi["type"].lower() != "source":
                 dq.append(up)
-            else:
-                src_inst_name = fi["name"]
-                src_map_id = fi["mapping_id"]
+                continue
 
-                # Resolve physical object full name for this Source instance
-                full = ""
-                for ms in st.all_rows("map_sources"):
-                    if ms["mapping_id"] != src_map_id:
-                        continue
-                    obj = st.by_id("physical_objects", "object_id").get(ms["object_id"])
-                    if obj and obj["name"] == src_inst_name:
-                        full = obj["full_name"]; break
-                if not full:
+            src_inst_name = fi["name"]
+            src_map_id = fi["mapping_id"]
+
+            # resolve full physical name of this source instance in its mapping
+            full = ""
+            for ms in st.all_rows("map_sources"):
+                if ms["mapping_id"] != src_map_id:
+                    continue
+                obj = st.by_id("physical_objects", "object_id").get(ms["object_id"])
+                if obj and obj["name"] == src_inst_name:
+                    full = obj["full_name"]; break
+            if not full:
+                continue
+
+            # mappings that have this as TARGET (exact)
+            candidate_map_names = tgt_map_by_full.get(full, [])
+            if not candidate_map_names:
+                continue
+
+            exact_col = (fp["name"] or "").lower()
+            for upstream_map_name in candidate_map_names:
+                upstream_map_id = next((mid for mid, m in maps_idx.items() if m["name"] == upstream_map_name), "")
+                if not upstream_map_id:
+                    continue
+                tgt_inst_name = _target_instance_for_physical(upstream_map_id, full)
+                if not tgt_inst_name:
                     continue
 
-                # Find mappings whose TARGET physical object matches this full name
-                candidate_map_names = tgt_map_by_full.get(full, [])
-                if not candidate_map_names:
+                # exact column name on that target's INPUT
+                candidate_ports = [p for p in ports_idx.values()
+                    if p["instance_id"] == f"{upstream_map_id}:{tgt_inst_name}" and p["direction"] == "INPUT"]
+                match_port = next((p for p in candidate_ports if (p["name"] or "").lower() == exact_col), None)
+                if not match_port:
                     continue
 
-                # Collect only candidates that have an INPUT target port with exact same column name
-                exact_col = (fp["name"] or "").lower()
-                qualified_candidates = []
-                for upstream_map_name in candidate_map_names:
-                    upstream_map_id = next((mid for mid, m in maps_idx.items()
-                                            if m["name"] == upstream_map_name), "")
-                    if not upstream_map_id:
-                        continue
-
-                    # Which instance in that mapping is the Target bound to this physical full?
-                    tgt_inst_name = _target_instance_for_physical(upstream_map_id, full)
-                    if not tgt_inst_name:
-                        continue
-
-                    # Look for an INPUT port with EXACT same column name (case-insensitive)
-                    candidate_ports = [p for p in ports_idx.values()
-                        if p["instance_id"] == f"{upstream_map_id}:{tgt_inst_name}" and p["direction"] == "INPUT"]
-                    match_port = next((p for p in candidate_ports if (p["name"] or "").lower() == exact_col), None)
-                    if match_port:
-                        qualified_candidates.append((upstream_map_id, upstream_map_name, tgt_inst_name, match_port["name"]))
-
-                # Enforce uniqueness to prevent blow-up
-                if REQUIRE_UNIQUE_UPSTREAM and len(qualified_candidates) != 1:
-                    # ambiguous or none -> do not cross-stitch
-                    continue
-
-                # If not requiring uniqueness, you could loop over qualified_candidates;
-                # here we take the unique one.
-                upstream_map_id, upstream_map_name, tgt_inst_name, best_name = qualified_candidates[0]
-                next_pid = f"{upstream_map_id}:{tgt_inst_name}:{best_name}"
-
-                key = (full, upstream_map_name, fp["name"], best_name)
+                # prevent cross cycles
+                key = (full, upstream_map_name, fp["name"])
                 if key in visited_cross:
                     continue
                 visited_cross.add(key)
@@ -223,14 +210,15 @@ def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
                 results.append({
                     "hop_no": hop,
                     "mapping": f"{maps_idx[src_map_id]['name']} -> {upstream_map_name}",
-                    "from_instance": "(TARGET)", "from_port": best_name, "from_type": "Target",
-                    "to_instance": "(SOURCE)",  "to_port":   fp["name"], "to_type":  "Source",
+                    "from_instance": "(TARGET)", "from_port": match_port["name"], "from_type": "Target",
+                    "to_instance": "(SOURCE)",  "to_port":   fp["name"],         "to_type":  "Source",
                     "operation": "cross_workflow (exact)",
                     "expression": "", "join_condition": "",
                     "stage": "cross_workflow",
                     "evidence": full
                 })
 
+                next_pid = f"{upstream_map_id}:{tgt_inst_name}:{match_port['name']}"
                 dq.append(next_pid)
 
     return results
