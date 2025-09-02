@@ -38,35 +38,54 @@ def _mapping_name_by_instance_id(instance_id: str) -> str:
     return mapping[0]["name"] if mapping else ""
 
 def find_target_ports_by_field(field_like: str) -> List[Dict]:
-    field_like = (field_like or "").lower().replace("_", "")
-    out_pref = []
-    out_fallback = []
+    # Use ONLY exact case-insensitive match on the target column name.
+    # If the user passes a qualified name like FOLDER:MAP:INST:COL or SCHEMA.TABLE.COL,
+    # we still match exactly on the final COL token only.
+    q_raw = field_like or ""
+    if ":" in q_raw or "." in q_raw:
+        q_raw = q_raw.split(":")[-1].split(".")[-1]
+    q_ci = (q_raw or "").lower()
+    if not q_ci:
+        return []
 
     ports = st.all_rows("ports")
     insts = _index_instances()
     edges = st.all_rows("edges")
-    has_out = {e["from_port_id"] for e in edges}
-    has_in = {e["to_port_id"] for e in edges}
+
+    has_out_norm = { (e["from_port_id"] or "").lower() for e in edges }
+    has_in_norm  = { (e["to_port_id"]   or "").lower() for e in edges }
+
+    results: List[Dict] = []
 
     for p in ports:
         inst = insts.get(p["instance_id"])
         if not inst:
             continue
-        is_targetish = (inst.get("type") == "Target") or (p["direction"] == "INPUT" and p["port_id"] not in has_out)
+
+        # treat as a target column if it's a real Target instance
+        # OR an INPUT sink with no outgoing edge
+        is_targetish = (inst.get("type") == "Target") or (
+            p.get("direction") == "INPUT" and (p["port_id"] or "").lower() not in has_out_norm
+        )
         if not is_targetish:
             continue
-        norm = p["name"].lower().replace("_", "")
-        if field_like in norm:
-            row = {
-                "port_id": p["port_id"],
-                "instance_id": p["instance_id"],
-                "port_name": p["name"],
-                "instance_name": inst["name"],
-                "mapping_name": _mapping_name_by_instance_id(p["instance_id"]).strip()
-            }
-            (out_pref if p["port_id"] in has_in else out_fallback).append(row)
 
-    return out_pref or out_fallback
+        # EXACT match only (case-insensitive). Do NOT strip underscores/punctuation.
+        if (p.get("name", "") or "").lower() != q_ci:
+            continue
+
+        results.append({
+            "port_id": p["port_id"],
+            "instance_id": p["instance_id"],
+            "port_name": p["name"],
+            "instance_name": inst["name"],
+            "mapping_name": _mapping_name_by_instance_id(p["instance_id"]).strip()
+        })
+
+    # deterministic: prefer starts that already have inbound edges
+    results.sort(key=lambda r: ((r["port_id"] or "").lower() not in has_in_norm,
+                                r["mapping_name"], r["instance_name"], r["port_name"]))
+    return results
 
 def attach_expr_and_join(from_port_id: str, from_instance_id: str) -> Dict[str, str]:
     exprs = [e for e in st.all_rows("expressions") if e["port_id"] == from_port_id and e["kind"] == "expr"]
