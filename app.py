@@ -138,57 +138,119 @@ def debug_edges():
 @app.route("/api/summary")
 def summary():
     """
-    Build a deterministic summary from upstream_lineage_multi:
-    One row per (chain_id, mapping) in chain order.
+    Returns:
+      - pair_rows: unique end-to-end pairs as DB.SCHEMA.TABLE.FIELD -> DB.SCHEMA.TABLE.FIELD
+      - summary_rows: per-mapping rollup (steps/exprs/joins)
     """
     from lineage import upstream_lineage_multi
+    import storage as st
 
     field = request.args.get("field", "")
     rows = upstream_lineage_multi(field)
 
-    # Group by (chain_id, mapping) and keep first step order
-    chains = {}
-    for r in sorted(rows, key=lambda x: (x.get("chain_id", 1), x.get("step_no", 0))):
-        cid = r.get("chain_id", 1)
-        mp  = r.get("mapping", "")
-        ch  = chains.setdefault(cid, {})
-        itm = ch.setdefault(mp, {
-            "chain_id": cid,
-            "mapping": mp,
-            "first_step": r.get("step_no", 0),
-            "steps": 0,
-            "exprs": set(),
-            "joins": set(),
-        })
-        itm["steps"] += 1
-        if r.get("expression"):
-            itm["exprs"].add(r["expression"])
-        if r.get("join_condition"):
-            itm["joins"].add(r["join_condition"])
+    # ---- indices
+    maps = st.all_rows("mappings")
+    map_ids_by_name = {}
+    for m in maps:
+        map_ids_by_name.setdefault(m["name"], []).append(m["mapping_id"])
 
-    # Flatten to table rows in chain order
+    insts = st.all_rows("instances")
+    inst_exists = {i["instance_id"] for i in insts}
+
+    # instance -> physical object
+    inst_phys = st.all_rows("instance_phys")  # [{"instance_id","object_id","role"}]
+    inst_to_obj = {r["instance_id"]: r["object_id"] for r in inst_phys}
+
+    phys_idx = st.by_id("physical_objects", "object_id")  # {object_id: {..., full_name}}
+
+    def resolve_instance_id(mapping_name: str, instance_name: str) -> str:
+        """Find the concrete instance_id for (mapping, instance) or ''."""
+        for mid in map_ids_by_name.get(mapping_name, []):
+            iid = f"{mid}:{instance_name}"
+            if iid in inst_exists:
+                return iid
+        return ""
+
+    def fqf(mapping_name: str, instance_name: str, field_name: str) -> str:
+        """Return DB.SCHEMA.TABLE.FIELD if resolvable, else just FIELD."""
+        if not (mapping_name and instance_name and field_name):
+            return field_name or ""
+        iid = resolve_instance_id(mapping_name, instance_name)
+        obj_id = inst_to_obj.get(iid, "")
+        obj = phys_idx.get(obj_id, {}) if obj_id else {}
+        full = obj.get("full_name", "")
+        return f"{full}.{field_name}" if full else (field_name or "")
+
+    # ---- build end-to-end pairs (within each chain)
+    from collections import defaultdict
+    rows_by_chain = defaultdict(list)
+    for r in rows:
+        rows_by_chain[r.get("chain_id", 1)].append(r)
+
+    pair_set = set()
+    pair_rows = []
+
+    def is_real_instance(name: str) -> bool:
+        # skip pseudo markers like "(SOURCE)" used in cross rows
+        return bool(name) and not str(name).startswith("(")
+
+    for cid, crs in rows_by_chain.items():
+        to_keys   = set(f"{r['to_instance']}::{r['to_port']}"   for r in crs)
+        from_keys = set(f"{r['from_instance']}::{r['from_port']}" for r in crs)
+
+        leaves = [r for r in crs
+                  if f"{r['from_instance']}::{r['from_port']}" not in to_keys
+                  and is_real_instance(r["from_instance"])]
+
+        tails  = [r for r in crs
+                  if f"{r['to_instance']}::{r['to_port']}" not in from_keys
+                  and is_real_instance(r["to_instance"])]
+
+        for leaf in leaves:
+            for tail in tails:
+                # Resolve physical qualified fields
+                src_fq = fqf(leaf["mapping"], leaf["from_instance"], leaf["from_port"])
+                tgt_fq = fqf(tail["mapping"], tail["to_instance"],  tail["to_port"])
+                key = (src_fq, tgt_fq)
+                if not src_fq or not tgt_fq or key in pair_set:
+                    continue
+                pair_set.add(key)
+                pair_rows.append({
+                    "mapping": tail["mapping"],   # <-- add mapping name for the target side
+                    "source":  src_fq,            #     DB.SCHEMA.TABLE.FIELD
+                    "target":  tgt_fq,            #     DB.SCHEMA.TABLE.FIELD
+                })
+        pair_rows.sort(key=lambda r: (r["mapping"], r["target"], r["source"]))
+
+
+    # ---- Per-mapping rollup (kept simple)
+    agg = {}
+    for r in rows:
+        k = r.get("mapping", "")
+        g = agg.setdefault(k, {"mapping": k, "steps": 0, "exprs": set(), "joins": set()})
+        g["steps"] += 1
+        if r.get("expression"):
+            g["exprs"].add(r["expression"])
+        if r.get("join_condition"):
+            g["joins"].add(r["join_condition"])
+
     summary_rows = []
-    for cid, maps in chains.items():
-        items = list(maps.values())
-        items.sort(key=lambda x: x["first_step"])
-        seq = 0
-        for it in items:
-            seq += 1
-            summary_rows.append({
-                "chain_id": cid,
-                "seq": seq,                            # mapping order within the chain
-                "mapping": it["mapping"],
-                "steps": it["steps"],
-                "expr_count": len(it["exprs"]),
-                "join_count": len(it["joins"]),
-                "expr_examples": list(it["exprs"])[:2],   # show a couple inline; expand in UI if needed
-                "join_examples": list(it["joins"])[:1],
-            })
+    for g in sorted(agg.values(), key=lambda x: x["mapping"]):
+        summary_rows.append({
+            "mapping": g["mapping"],
+            "steps": g["steps"],
+            "expr_count": len(g["exprs"]),
+            "join_count": len(g["joins"]),
+            "expr_examples": list(g["exprs"])[:2],
+            "join_examples": list(g["joins"])[:1],
+        })
 
     return jsonify({
         "total_rows": len(rows),
-        "summary_rows": summary_rows
+        "pair_rows": pair_rows,
+        "summary_rows": summary_rows,
     })
+
 
 
 if __name__ == "__main__":

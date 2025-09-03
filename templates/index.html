@@ -29,6 +29,18 @@
     <span id="status" class="muted"></span>
   </div>
 
+  <h3>End-to-End Pairs</h3>
+  <table id="pairsTbl">
+    <thead>
+      <tr>
+        <th>Mapping</th>
+        <th>Source</th>  <!-- DB.SCHEMA.TABLE.FIELD -->
+        <th>Target</th>  <!-- DB.SCHEMA.TABLE.FIELD -->
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
   <!-- Summary table -->
   <h3 id="sumTitle">Summary</h3>
   <table id="summaryTbl">
@@ -79,6 +91,21 @@
 
     function escapeHtml(s) {
       return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function renderPairs(payload) {
+      const tbody = $('#pairsTbl tbody');
+      tbody.innerHTML = '';
+      const rows = payload.pair_rows || [];
+      for (const r of rows) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${escapeHtml(r.mapping || '')}</td>
+          <td class="mono wrap">${escapeHtml(r.source || '')}</td>
+          <td class="mono wrap">${escapeHtml(r.target || '')}</td>
+        `;
+        tbody.appendChild(tr);
+      }
     }
 
     function renderSummary(payload) {
