@@ -113,6 +113,9 @@ def parse_mapping_xml(xml_path: str) -> str:
     phys_tgt: List[Dict] = []
     map_src: List[Dict] = []
     map_tgt: List[Dict] = []
+    inst_phys: List[Dict] = []     # maps an instance to its physical object
+    sq_assoc:  List[Dict] = []     # maps an SQ instance to one or more associated source instance names
+
 
     def _add_instance(inst_name: str, inst_type: str) -> str:
         inst_id = _id(mapping_id, inst_name)
@@ -146,6 +149,8 @@ def parse_mapping_xml(xml_path: str) -> str:
             "full_name": meta["full"],
         })
         map_src.append({"mapping_id": mapping_id, "object_id": obj_id})
+        inst_phys.append({"instance_id": inst_id, "object_id": obj_id, "role": "Source"})
+
 
     def _add_ports_for_target_instance(inst_id: str, tgt_key: str):
         meta = folder_targets.get(tgt_key)
@@ -169,6 +174,8 @@ def parse_mapping_xml(xml_path: str) -> str:
             "full_name": meta["full"],
         })
         map_tgt.append({"mapping_id": mapping_id, "object_id": obj_id})
+        inst_phys.append({"instance_id": inst_id, "object_id": obj_id, "role": "Target"})
+
 
     # ---- Transformations (instances + ports + intra-transform edges from EXPRESSION only)
     tx_names = set()
@@ -270,6 +277,26 @@ def parse_mapping_xml(xml_path: str) -> str:
         rawt    = (_aget(inst, "TYPE", "TRANSFORMATION_TYPE", "TRANSFORMATIONTYPE") or "").strip().lower()
         refname = _aget(inst, "TRANSFORMATION_NAME", "REFOBJECTNAME", "REF_OBJECT_NAME", "REFOBJECT_NAME", "TRANFIRMATION_NAME") or ""
         refU    = refname.upper()
+        # If this is a Source Qualifier, collect associated sources (attr or child elements)
+        if (rawt or "").strip().lower() == "source qualifier":
+            # attribute form
+            assoc_attr = _aget(inst, "ASSOCIATED_SOURCE_INSTANCE", "ASSOCIATEDSOURCEINSTANCE")
+            if assoc_attr:
+                sq_assoc.append({
+                    "mapping_id": mapping_id,
+                    "sq_instance_id": _id(mapping_id, iname),
+                    "source_instance_name": assoc_attr.strip()
+                })
+            # child element(s) form
+            for child in inst.findall("./ASSOCIATED_SOURCE_INSTANCE"):
+                nm = (child.get("NAME") or child.get("INSTANCE") or (child.text or "")).strip()
+                if nm:
+                    sq_assoc.append({
+                        "mapping_id": mapping_id,
+                        "sq_instance_id": _id(mapping_id, iname),
+                        "source_instance_name": nm
+                    })
+
 
         is_target = (rawt in ("target", "target definition")) or (refU in folder_targets)
         is_source = (rawt in ("source", "source definition")) or (refU in folder_sources)
@@ -328,5 +355,8 @@ def parse_mapping_xml(xml_path: str) -> str:
     st.insert_if_missing("physical_objects", phys_src + phys_tgt, ("object_id",))
     st.insert_if_missing("map_sources", map_src, ("mapping_id", "object_id"))
     st.insert_if_missing("map_targets", map_tgt, ("mapping_id", "object_id"))
+    st.insert_if_missing("instance_phys", inst_phys, ("instance_id", "object_id"))
+    st.insert_if_missing("sq_assoc", sq_assoc, ("mapping_id", "sq_instance_id", "source_instance_name"))
+
 
     return mapping_id

@@ -156,6 +156,18 @@ def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
     inst_idx  = st.by_id("instances", "instance_id")
     maps_idx  = st.by_id("mappings", "mapping_id")
 
+    # instance → physical object (only for role=Source/Target as recorded by the parser)
+    inst_phys_rows = st.all_rows("instance_phys")
+    inst_to_obj = { r["instance_id"]: r["object_id"] for r in inst_phys_rows }  # we’ll filter by role when needed
+    phys_idx = st.by_id("physical_objects", "object_id")
+
+    # SQ instance → [associated source instance names]
+    sq_rows = st.all_rows("sq_assoc")
+    sq_to_sources = {}
+    for r in sq_rows:
+        sq_to_sources.setdefault(r["sq_instance_id"], []).append(r["source_instance_name"])
+
+
     def _idnorm(pid: str) -> str:
         return (pid or "").lower()
 
@@ -235,29 +247,13 @@ def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
                     visited_ports.add(up)
                     dist[up] = level
                     dq.append(up)
-
-                # Strict cross-workflow: only when FROM instance is a Source
-                if fi["type"].lower() == "source":
-                    src_inst_name = fi["name"]
-                    src_map_id = fi["mapping_id"]
-
-                    # physical full name for this source instance
-                    full = ""
-                    for ms in st.all_rows("map_sources"):
-                        if ms["mapping_id"] != src_map_id:
-                            continue
-                        obj = st.by_id("physical_objects", "object_id").get(ms["object_id"])
-                        if obj and obj["name"] == src_inst_name:
-                            full = obj["full_name"]; break
-                    if not full:
-                        continue
-
-                    # all mappings whose TARGET physical matches exactly
+                    
+                def _cross_by_full(full: str, col_name: str, src_map_id: str):
+                    # mappings whose TARGET physical equals this full name
                     candidate_map_names = tgt_map_by_full.get(full, [])
                     if not candidate_map_names:
-                        continue
-
-                    exact_col = (fp["name"] or "").lower()
+                        return
+                    exact_col = (col_name or "").lower()
                     for upstream_map_name in candidate_map_names:
                         upstream_map_id = next((mid for mid, m in maps_idx.items()
                                                 if m["name"] == upstream_map_name), "")
@@ -266,27 +262,27 @@ def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
                         tgt_inst_name = _target_instance_for_physical(upstream_map_id, full)
                         if not tgt_inst_name:
                             continue
-
                         # exact column on that target's INPUT
                         candidate_ports = [p for p in ports_idx.values()
                             if p["instance_id"] == f"{upstream_map_id}:{tgt_inst_name}" and p["direction"] == "INPUT"]
                         match_port = next((p for p in candidate_ports
-                                           if (p["name"] or "").lower() == exact_col), None)
+                                        if (p["name"] or "").lower() == exact_col), None)
                         if not match_port:
                             continue
 
-                        cross_key = (full, upstream_map_name, fp["name"])
+                        cross_key = (full, upstream_map_name, col_name)
                         if cross_key in visited_cross:
                             continue
                         visited_cross.add(cross_key)
 
-                        level_x = level  # cross step sits between levels
+                        # record the cross step (use existing variables in your scope)
+                        level_x = dist[cur] + 1  # sits between levels
                         chain_rows.append({
                             "chain_id": chain_id,
                             "level": level_x,
                             "mapping": f"{maps_idx[src_map_id]['name']} -> {upstream_map_name}",
                             "from_instance": "(TARGET)", "from_port": match_port["name"], "from_type": "Target",
-                            "to_instance": "(SOURCE)",  "to_port":   fp["name"],         "to_type":  "Source",
+                            "to_instance": "(SOURCE)",  "to_port":   col_name,           "to_type":  "Source",
                             "operation": "cross_workflow (exact)",
                             "expression": "", "join_condition": "",
                             "stage": "cross_workflow",
@@ -296,8 +292,36 @@ def upstream_lineage_multi(field: str, max_rows: int = 10000) -> List[Dict]:
                         next_pid = f"{upstream_map_id}:{tgt_inst_name}:{match_port['name']}"
                         if next_pid not in visited_ports:
                             visited_ports.add(next_pid)
-                            dist[next_pid] = level_x   # next mapping edges will be level_x+1
+                            dist[next_pid] = level_x
                             dq.append(next_pid)
+
+                # Strict cross-workflow: only when FROM instance is a Source
+                fi_type = (fi["type"] or "").lower()
+                # ---- Strict cross-workflow boundary detection ----
+                fi_type = (fi["type"] or "").lower()
+
+                # CASE 1: true Source instance → cross by its physical object
+                if fi_type == "source":
+                    obj_id = inst_to_obj.get(fi["instance_id"], "")
+                    full = phys_idx.get(obj_id, {}).get("full_name", "") if obj_id else ""
+                    if not full:
+                        continue
+                    _cross_by_full(full, fp["name"], fi["mapping_id"])
+
+                # CASE 2: Source Qualifier instance → cross by each associated Source instance's physical object
+                elif fi_type == "source qualifier":
+                    sq_id = fi["instance_id"]                           # e.g., FOLDER:MAP:SQ_LAND_CLAIM
+                    src_names = sq_to_sources.get(sq_id, [])
+                    if not src_names:
+                        continue
+                    for src_name in src_names:
+                        src_inst_id = f"{fi['mapping_id']}:{src_name}"  # instance_id form for the source
+                        obj_id = inst_to_obj.get(src_inst_id, "")
+                        full = phys_idx.get(obj_id, {}).get("full_name", "") if obj_id else ""
+                        if not full:
+                            continue
+                        _cross_by_full(full, fp["name"], fi["mapping_id"])
+
 
         # per-chain ordering and step numbering
         chain_rows.sort(key=lambda r: (r["level"], r["stage"], r["mapping"], r["from_instance"], r["from_port"]))
