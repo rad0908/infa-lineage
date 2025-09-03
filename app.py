@@ -139,16 +139,17 @@ def debug_edges():
 def summary():
     """
     Returns:
-      - pair_rows: unique end-to-end pairs as DB.SCHEMA.TABLE.FIELD -> DB.SCHEMA.TABLE.FIELD
+      - pair_rows: unique end-to-end pairs as DB.SCHEMA.TABLE.FIELD -> DB.SCHEMA.TABLE.FIELD (+ mapping)
       - summary_rows: per-mapping rollup (steps/exprs/joins)
     """
     from lineage import upstream_lineage_multi
     import storage as st
+    from collections import defaultdict
 
     field = request.args.get("field", "")
     rows = upstream_lineage_multi(field)
 
-    # ---- indices
+    # ---- indices for physical resolution ----
     maps = st.all_rows("mappings")
     map_ids_by_name = {}
     for m in maps:
@@ -165,6 +166,8 @@ def summary():
 
     def resolve_instance_id(mapping_name: str, instance_name: str) -> str:
         """Find the concrete instance_id for (mapping, instance) or ''."""
+        if not (mapping_name and instance_name):
+            return ""
         for mid in map_ids_by_name.get(mapping_name, []):
             iid = f"{mid}:{instance_name}"
             if iid in inst_exists:
@@ -173,16 +176,15 @@ def summary():
 
     def fqf(mapping_name: str, instance_name: str, field_name: str) -> str:
         """Return DB.SCHEMA.TABLE.FIELD if resolvable, else just FIELD."""
-        if not (mapping_name and instance_name and field_name):
-            return field_name or ""
+        if not field_name:
+            return ""
         iid = resolve_instance_id(mapping_name, instance_name)
         obj_id = inst_to_obj.get(iid, "")
         obj = phys_idx.get(obj_id, {}) if obj_id else {}
         full = obj.get("full_name", "")
-        return f"{full}.{field_name}" if full else (field_name or "")
+        return f"{full}.{field_name}" if full else field_name
 
-    # ---- build end-to-end pairs (within each chain)
-    from collections import defaultdict
+    # ---- group rows by chain ----
     rows_by_chain = defaultdict(list)
     for r in rows:
         rows_by_chain[r.get("chain_id", 1)].append(r)
@@ -190,40 +192,46 @@ def summary():
     pair_set = set()
     pair_rows = []
 
-    def is_real_instance(name: str) -> bool:
-        # skip pseudo markers like "(SOURCE)" used in cross rows
-        return bool(name) and not str(name).startswith("(")
+    def is_real_inst(name: str) -> bool:
+        return bool(name) and not str(name).startswith("(")  # exclude "(SOURCE)"/"(TARGET)" markers
 
     for cid, crs in rows_by_chain.items():
-        to_keys   = set(f"{r['to_instance']}::{r['to_port']}"   for r in crs)
-        from_keys = set(f"{r['from_instance']}::{r['from_port']}" for r in crs)
-
+        # primary (type-based) leaf/tail detection
         leaves = [r for r in crs
-                  if f"{r['from_instance']}::{r['from_port']}" not in to_keys
-                  and is_real_instance(r["from_instance"])]
-
+                  if (r.get("from_type","").lower() == "source") and is_real_inst(r.get("from_instance",""))]
         tails  = [r for r in crs
-                  if f"{r['to_instance']}::{r['to_port']}" not in from_keys
-                  and is_real_instance(r["to_instance"])]
+                  if (r.get("to_type","").lower() == "target") and is_real_inst(r.get("to_instance",""))]
 
+        # fallback: set-difference heuristic if types are missing
+        if not leaves or not tails:
+            to_keys   = set(f"{r.get('to_instance')}::{r.get('to_port')}"   for r in crs)
+            from_keys = set(f"{r.get('from_instance')}::{r.get('from_port')}" for r in crs)
+            if not leaves:
+                leaves = [r for r in crs if f"{r.get('from_instance')}::{r.get('from_port')}" not in to_keys and is_real_inst(r.get("from_instance",""))]
+            if not tails:
+                tails  = [r for r in crs if f"{r.get('to_instance')}::{r.get('to_port')}" not in from_keys and is_real_inst(r.get("to_instance",""))]
+
+        # build pairs
         for leaf in leaves:
             for tail in tails:
-                # Resolve physical qualified fields
-                src_fq = fqf(leaf["mapping"], leaf["from_instance"], leaf["from_port"])
-                tgt_fq = fqf(tail["mapping"], tail["to_instance"],  tail["to_port"])
-                key = (src_fq, tgt_fq)
-                if not src_fq or not tgt_fq or key in pair_set:
+                src_fq = fqf(leaf.get("mapping",""), leaf.get("from_instance",""), leaf.get("from_port",""))
+                tgt_fq = fqf(tail.get("mapping",""), tail.get("to_instance",""),  tail.get("to_port",""))
+                if not src_fq or not tgt_fq:
+                    continue
+                key = (tail.get("mapping",""), src_fq, tgt_fq)
+                if key in pair_set:
                     continue
                 pair_set.add(key)
                 pair_rows.append({
-                    "mapping": tail["mapping"],   # <-- add mapping name for the target side
-                    "source":  src_fq,            #     DB.SCHEMA.TABLE.FIELD
-                    "target":  tgt_fq,            #     DB.SCHEMA.TABLE.FIELD
+                    "mapping": tail.get("mapping",""),
+                    "source":  src_fq,
+                    "target":  tgt_fq,
                 })
-        pair_rows.sort(key=lambda r: (r["mapping"], r["target"], r["source"]))
 
+    # nice stable ordering
+    pair_rows.sort(key=lambda r: (r["mapping"], r["target"], r["source"]))
 
-    # ---- Per-mapping rollup (kept simple)
+    # ---- per-mapping rollup (unchanged) ----
     agg = {}
     for r in rows:
         k = r.get("mapping", "")
