@@ -7,40 +7,55 @@
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }
     .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-    input[type="text"] { padding:8px; min-width: 280px; }
+    input[type="text"] { padding:8px; min-width: 320px; }
     button { padding:8px 12px; cursor:pointer; }
     table { border-collapse: collapse; width: 100%; margin-top: 16px; }
-    th, td { border:1px solid #ddd; padding:6px 8px; font-size: 13px; }
+    th, td { border:1px solid #ddd; padding:6px 8px; font-size: 13px; vertical-align: top; }
     th { background:#f5f7fa; text-align:left; position: sticky; top: 0; }
     .muted { color:#666; font-size:12px; }
     .pill { font-size: 11px; padding:2px 6px; border-radius:12px; background:#eef2ff; }
     .right { text-align:right; }
     .wrap { white-space: pre-wrap; word-break: break-word; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
   </style>
 </head>
 <body>
   <h2>Informatica Lineage (Strict)</h2>
 
   <div class="row">
-    <input id="fieldInput" type="text" placeholder="Search by exact column name (e.g., OUTSTANDING_BAL)" />
+    <input id="fieldInput" type="text" placeholder="Exact column name (e.g., OUTSTANDING_BAL)" />
     <button id="btnLookup">Lookup</button>
     <button id="btnReload">Reload XMLs</button>
     <span id="status" class="muted"></span>
   </div>
 
+  <!-- Summary table -->
+  <h3 id="sumTitle">Summary</h3>
+  <table id="summaryTbl">
+    <thead>
+      <tr>
+        <th>Chain</th>
+        <th>Order</th>
+        <th>Mapping</th>
+        <th>Steps</th>
+        <th>Expressions</th>
+        <th>Joins</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <!-- Full results table (no Level / From Type / To Type) -->
   <table id="tbl">
     <thead>
       <tr>
         <th>Chain</th>
-        <th>Order</th>           <!-- step_no -->
-        <th>Level</th>           <!-- level_display (source→target) -->
+        <th>Order</th>  <!-- step_no -->
         <th>Mapping</th>
         <th>From Instance</th>
         <th>From Port</th>
-        <th>From Type</th>
         <th>To Instance</th>
         <th>To Port</th>
-        <th>To Type</th>
         <th>Operation</th>
         <th>Expression</th>
         <th>Join</th>
@@ -51,8 +66,7 @@
   </table>
 
   <script>
-    const $ = sel => document.querySelector(sel);
-    const $$ = sel => Array.from(document.querySelectorAll(sel));
+    const $  = sel => document.querySelector(sel);
 
     async function reloadXMLs() {
       setStatus('Reloading XMLs…');
@@ -61,54 +75,56 @@
       setStatus(`Loaded: ${j.loaded?.length || 0} file(s). Errors: ${j.errors?.length || 0}`);
     }
 
-    function setStatus(msg) {
-      $('#status').textContent = msg || '';
+    function setStatus(msg) { $('#status').textContent = msg || ''; }
+
+    function escapeHtml(s) {
+      return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
 
-    function computeMaxLevelPerChain(rows) {
-      const maxByChain = {};
+    function renderSummary(payload) {
+      const tbody = $('#summaryTbl tbody');
+      tbody.innerHTML = '';
+      const rows = payload.summary_rows || [];
       for (const r of rows) {
-        const cid = r.chain_id ?? 1;
-        const lvl = r.level ?? 0;
-        if (!(cid in maxByChain) || lvl > maxByChain[cid]) maxByChain[cid] = lvl;
+        const exprPreview = (r.expr_examples || []).map(x => `<div class="mono wrap">• ${escapeHtml(x)}</div>`).join('') || '';
+        const joinPreview = (r.join_examples || []).map(x => `<div class="mono wrap">• ${escapeHtml(x)}</div>`).join('') || '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><span class="pill">${r.chain_id}</span></td>
+          <td class="right">${r.seq}</td>
+          <td>${r.mapping}</td>
+          <td class="right">${r.steps}</td>
+          <td class="wrap">${exprPreview}<div class="muted">${r.expr_count} total</div></td>
+          <td class="wrap">${joinPreview}<div class="muted">${r.join_count} total</div></td>
+        `;
+        tbody.appendChild(tr);
       }
-      return maxByChain;
     }
 
-    function render(rows) {
-      // Ensure deterministic order: (chain_id, step_no) if present; fallback stable
+    function renderFull(rows) {
+      // Deterministic order: by chain_id then step_no
       rows.sort((a,b) =>
         (a.chain_id - b.chain_id) ||
-        ((a.step_no ?? 0) - (b.step_no ?? 0)) ||
-        ((a.level_display ?? 0) - (b.level_display ?? 0))
+        ((a.step_no ?? 0) - (b.step_no ?? 0))
       );
-
-      // If backend didn't provide level_display, derive it from max(level) per chain
-      const maxByChain = computeMaxLevelPerChain(rows);
 
       const tbody = $('#tbl tbody');
       tbody.innerHTML = '';
-      for (const r of rows) {
-        const levelDisplay = (r.level_display !== undefined)
-          ? r.level_display
-          : ((maxByChain[r.chain_id ?? 1] ?? 0) - (r.level ?? 0));
 
+      for (const r of rows) {
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td><span class="pill">${r.chain_id ?? 1}</span></td>
           <td class="right">${r.step_no ?? ''}</td>
-          <td class="right">${levelDisplay}</td>
           <td>${r.mapping || ''}</td>
           <td>${r.from_instance || ''}</td>
           <td>${r.from_port || ''}</td>
-          <td>${r.from_type || ''}</td>
           <td>${r.to_instance || ''}</td>
           <td>${r.to_port || ''}</td>
-          <td>${r.to_type || ''}</td>
           <td>${r.operation || ''}</td>
-          <td class="wrap">${r.expression || ''}</td>
-          <td class="wrap">${r.join_condition || ''}</td>
-          <td class="wrap">${r.evidence || ''}</td>
+          <td class="wrap mono">${escapeHtml(r.expression || '')}</td>
+          <td class="wrap mono">${escapeHtml(r.join_condition || '')}</td>
+          <td class="wrap mono">${escapeHtml(r.evidence || '')}</td>
         `;
         tbody.appendChild(tr);
       }
@@ -118,18 +134,22 @@
     async function lookup() {
       const q = $('#fieldInput').value.trim();
       if (!q) { setStatus('Enter a column name.'); return; }
-      setStatus('Searching…');
+      setStatus('Summarizing…');
+
+      // 1) Summary
+      const sumRes = await fetch('/api/summary?field=' + encodeURIComponent(q));
+      const sumJson = await sumRes.json();
+      renderSummary(sumJson);
+
+      // 2) Full results
       const res = await fetch('/api/lookup?field=' + encodeURIComponent(q));
       const rows = await res.json();
-      render(rows);
+      renderFull(rows);
     }
 
     $('#btnLookup').addEventListener('click', lookup);
     $('#fieldInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') lookup(); });
     $('#btnReload').addEventListener('click', reloadXMLs);
-
-    // Optional: load a sample on first open (comment out if not desired)
-    // lookup();
   </script>
 </body>
 </html>

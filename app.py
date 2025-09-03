@@ -15,7 +15,6 @@ MAPPINGS_DIR = Path(_env_dir) if _env_dir and _env_dir.strip() else Path(__file_
 
 app = Flask(__name__)
 
-
 def _xml_files_in_dir(root: Path):
     if not root.exists():
         return []
@@ -134,6 +133,62 @@ def debug_edges():
         if to_ok and fr_ok:
             rows.append(e)
     return {"count": len(rows), "sample": rows[:100]}
+
+
+@app.route("/api/summary")
+def summary():
+    """
+    Build a deterministic summary from upstream_lineage_multi:
+    One row per (chain_id, mapping) in chain order.
+    """
+    from lineage import upstream_lineage_multi
+
+    field = request.args.get("field", "")
+    rows = upstream_lineage_multi(field)
+
+    # Group by (chain_id, mapping) and keep first step order
+    chains = {}
+    for r in sorted(rows, key=lambda x: (x.get("chain_id", 1), x.get("step_no", 0))):
+        cid = r.get("chain_id", 1)
+        mp  = r.get("mapping", "")
+        ch  = chains.setdefault(cid, {})
+        itm = ch.setdefault(mp, {
+            "chain_id": cid,
+            "mapping": mp,
+            "first_step": r.get("step_no", 0),
+            "steps": 0,
+            "exprs": set(),
+            "joins": set(),
+        })
+        itm["steps"] += 1
+        if r.get("expression"):
+            itm["exprs"].add(r["expression"])
+        if r.get("join_condition"):
+            itm["joins"].add(r["join_condition"])
+
+    # Flatten to table rows in chain order
+    summary_rows = []
+    for cid, maps in chains.items():
+        items = list(maps.values())
+        items.sort(key=lambda x: x["first_step"])
+        seq = 0
+        for it in items:
+            seq += 1
+            summary_rows.append({
+                "chain_id": cid,
+                "seq": seq,                            # mapping order within the chain
+                "mapping": it["mapping"],
+                "steps": it["steps"],
+                "expr_count": len(it["exprs"]),
+                "join_count": len(it["joins"]),
+                "expr_examples": list(it["exprs"])[:2],   # show a couple inline; expand in UI if needed
+                "join_examples": list(it["joins"])[:1],
+            })
+
+    return jsonify({
+        "total_rows": len(rows),
+        "summary_rows": summary_rows
+    })
 
 
 if __name__ == "__main__":
