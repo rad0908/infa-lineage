@@ -104,6 +104,103 @@ def parse_mapping_xml(xml_path: str) -> str:
             "full": _full(t.get("DBDNAME"), t.get("OWNERNAME"), tname),
         }
 
+        # --- Folder-level MAPPLets ---
+    folder_mapplets: Dict[str, Dict] = {}  # KEY: MAPPLET NAME (UPPER) -> def
+
+    def _parse_mapplet_def(mp_el) -> Dict:
+        """Extract a reusable mapplet definition from <MAPPLET>."""
+        mp_name = (mp_el.get("NAME") or "").strip()
+        trans = []       # [{name,type, fields:[{name,dir,dtype,expr}], is_boundary:bool}]
+        edges_intra = [] # [{'from': (inst,port), 'to': (inst,port)}]
+        exprs_local = [] # [{'inst':..., 'port':..., 'raw':...}]
+
+        # Identify boundary transforms by TYPE
+        boundary_in_names = set()
+        boundary_out_names = set()
+
+        for t in mp_el.findall("./TRANSFORMATION"):
+            t_name = t.get("NAME") or ""
+            t_type = (t.get("TYPE") or "").strip()
+            is_in  = t_type.lower() == "mapplet input"
+            is_out = t_type.lower() == "mapplet output"
+            if is_in:  boundary_in_names.add(t_name)
+            if is_out: boundary_out_names.add(t_name)
+
+            fields = []
+            inputs_ci, vars_ci, outputs = {}, {}, []
+            for pf in t.findall("./TRANSFORMFIELD"):
+                pname = pf.get("NAME")
+                if not pname: 
+                    continue
+                pdir  = (pf.get("PORTTYPE") or "").upper()
+                dtype = pf.get("DATATYPE") or ""
+                fields.append({"name": pname, "dir": pdir, "dtype": dtype})
+
+                # capture expressions for OUTPUT and VARIABLE
+                expr_text = (
+                    pf.get("EXPRESSION") or
+                    (pf.findtext("./EXPRESSION") or pf.findtext("./EXPR")) or
+                    pf.get("EXPRESSIONVALUE") or pf.get("EXPRVALUE") or pf.get("VALUE") or
+                    ""
+                )
+                if expr_text and pdir in ("OUTPUT", "VARIABLE"):
+                    exprs_local.append({"inst": t_name, "port": pname, "raw": expr_text})
+
+                if pdir == "INPUT":
+                    inputs_ci[pname.lower()] = pname
+                elif pdir == "VARIABLE":
+                    vars_ci[pname.lower()] = pname
+                elif pdir == "OUTPUT":
+                    outputs.append({"name": pname, "expr_text": expr_text})
+
+            # Strict intra-transform edges from OUTPUT expr tokens
+            import re as _re
+            for od in outputs:
+                if not od["expr_text"]:
+                    continue
+                tokens = _re.findall(r"[A-Za-z_][A-Za-z0-9_]*", od["expr_text"])
+                for tok in tokens:
+                    tci = tok.lower()
+                    if tci in inputs_ci:
+                        edges_intra.append({"from": (t_name, inputs_ci[tci]), "to": (t_name, od["name"])})
+                    elif tci in vars_ci:
+                        edges_intra.append({"from": (t_name, vars_ci[tci]), "to": (t_name, od["name"])})
+
+            trans.append({"name": t_name, "type": t_type, "fields": fields, "is_boundary": is_in or is_out})
+
+        # Mapplet-level connectors
+        for c in mp_el.findall(".//CONNECTOR"):
+            fi = c.get("FROMINSTANCE") or c.get("FROM_INSTANCE") or c.get("FROMINSTANCENAME")
+            ti = c.get("TOINSTANCE")   or c.get("TO_INSTANCE")   or c.get("TOINSTANCENAME")
+            fp = c.get("FROMPORT") or c.get("FROM_FIELD") or c.get("FROMFIELD") or c.get("FROMPORTNAME") or c.get("FROMFIELDNAME")
+            tp = c.get("TOPORT")  or c.get("TO_FIELD")   or c.get("TOFIELD")   or c.get("TOPORTNAME")  or c.get("TOFIELDNAME")
+            if fi and ti and fp and tp:
+                edges_intra.append({"from": (fi, fp), "to": (ti, tp)})
+
+        # external port names = fields of boundary transforms
+        in_ports  = sorted({ f["name"] for t in trans if t["name"] in boundary_in_names  for f in t["fields"] if f["name"] })
+        out_ports = sorted({ f["name"] for t in trans if t["name"] in boundary_out_names for f in t["fields"] if f["name"] })
+
+        return {
+            "name": mp_name,
+            "transforms": trans,
+            "edges": edges_intra,
+            "exprs": exprs_local,
+            "in_ports": in_ports,
+            "out_ports": out_ports,
+            "boundary_in": list(boundary_in_names),
+            "boundary_out": list(boundary_out_names),
+        }
+
+    # collect all mapplets under the folder
+    for mp in folder_el.findall("./MAPPLET"):
+        nameU = (mp.get("NAME") or "").strip().upper()
+        if not nameU: 
+            continue
+        folder_mapplets[nameU] = _parse_mapplet_def(mp)
+
+
+
     # ---- Buckets
     instances: List[Dict] = []
     ports: List[Dict] = []
@@ -126,6 +223,91 @@ def parse_mapping_xml(xml_path: str) -> str:
             "name": inst_name,
         })
         return inst_id
+    
+    def _add_port(inst_id: str, name: str, direction: str, dtype: str = ""):
+        ports.append({
+            "port_id": _id(inst_id, name),
+            "instance_id": inst_id,
+            "name": name,
+            "dtype": dtype,
+            "direction": direction,
+        })
+
+    def _expand_mapplet_instance(inst_id: str, inst_name: str, mapplet_ref_upper: str):
+        """
+        Inline a mapplet definition into the current mapping namespace.
+        - Create internal instances as <mapping_id>:<inst_name>.<inner_name>
+        - Add inner ports/edges/expressions
+        - Add external ports on the mapplet instance (INPUT/OUTPUT) so mapping-level connectors can attach
+        - Bridge edges between external mapplet ports and boundary transforms inside
+        """
+        mpdef = folder_mapplets.get(mapplet_ref_upper)
+        if not mpdef:
+            return
+
+        # 1) materialize inner transforms
+        inner_name_to_inst_id = {}
+        for t in mpdef["transforms"]:
+            inner_name = t["name"]
+            inner_type = t["type"] or "Transformation"
+            prefixed_name = f"{inst_name}.{inner_name}"
+            prefixed_inst_id = _add_instance(prefixed_name, inner_type)
+            inner_name_to_inst_id[inner_name] = prefixed_inst_id
+
+            # ports
+            for f in t["fields"]:
+                # Mapplet Input/Output keep their field directions as exported
+                direction = f.get("dir") or "VARIABLE"
+                _add_port(prefixed_inst_id, f["name"], direction, f.get("dtype",""))
+
+        # 2) expressions on inner ports
+        for ex in mpdef["exprs"]:
+            pref_inst_id = inner_name_to_inst_id.get(ex["inst"])
+            if not pref_inst_id:
+                continue
+            exprs.append({
+                "port_id": _id(pref_inst_id, ex["port"]),
+                "kind": "expr",
+                "raw": ex["raw"],
+                "meta": None,
+            })
+
+        # 3) inner edges (expressions + connectors)
+        for ed in mpdef["edges"]:
+            fi, fp = ed["from"]; ti, tp = ed["to"]
+            fi_id = inner_name_to_inst_id.get(fi); ti_id = inner_name_to_inst_id.get(ti)
+            if not (fi_id and ti_id):
+                continue
+            edges.append({"from_port_id": _id(fi_id, fp), "to_port_id": _id(ti_id, tp)})
+
+        # 4) external ports on the mapplet instance (so mapping connectors can attach to them)
+        #    INPUTS are external inputs; OUTPUTS are external outputs
+        for p in mpdef["in_ports"]:
+            _add_port(inst_id, p, "INPUT", "")
+        for p in mpdef["out_ports"]:
+            _add_port(inst_id, p, "OUTPUT", "")
+
+        # 5) bridge: external INPUT  -> boundary IN (inside)
+        #            boundary OUT (inside) -> external OUTPUT
+        # use the first boundary transform of each kind (common case: single in/out transform)
+        in_boundaries  = mpdef["boundary_in"]
+        out_boundaries = mpdef["boundary_out"]
+        in_b_inst  = inner_name_to_inst_id.get(in_boundaries[0])  if in_boundaries else None
+        out_b_inst = inner_name_to_inst_id.get(out_boundaries[0]) if out_boundaries else None
+
+        if in_b_inst:
+            for p in mpdef["in_ports"]:
+                edges.append({
+                    "from_port_id": _id(inst_id, p),       # external -> internal
+                    "to_port_id":   _id(in_b_inst, p),
+                })
+        if out_b_inst:
+            for p in mpdef["out_ports"]:
+                edges.append({
+                    "from_port_id": _id(out_b_inst, p),    # internal -> external
+                    "to_port_id":   _id(inst_id, p),
+                })
+
 
     def _add_ports_for_source_instance(inst_id: str, src_key: str):
         meta = folder_sources.get(src_key)
@@ -300,11 +482,14 @@ def parse_mapping_xml(xml_path: str) -> str:
 
         is_target = (rawt in ("target", "target definition")) or (refU in folder_targets)
         is_source = (rawt in ("source", "source definition")) or (refU in folder_sources)
+        is_mapplet = (rawt == "mapplet") or ((refname or "").upper() in folder_mapplets)
 
         if is_target:
             instance_type_by_name[iname] = "Target"
         elif is_source:
             instance_type_by_name[iname] = "Source"
+        elif is_mapplet:
+            instance_type_by_name[iname] = "Transformation"
         else:
             instance_type_by_name[iname] = "Transformation"
         instance_refname_by_name[iname] = refname
@@ -325,6 +510,12 @@ def parse_mapping_xml(xml_path: str) -> str:
         if iname in tx_names:
             continue
         inst_id = _add_instance(iname, itype)
+        # Expand mapplet internals (if this instance references a folder-level MAPPLET)
+        refU = (instance_refname_by_name.get(iname, "") or "").upper()
+        rawt_lower = (rawt or "").lower()
+        if (rawt_lower == "mapplet") or (refU in folder_mapplets):
+            _expand_mapplet_instance(inst_id, iname, refU)
+
         if itype == "Source":
             key = (instance_refname_by_name.get(iname, "") or "").upper()
             if key:
