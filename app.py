@@ -2,53 +2,10 @@ from flask import Flask, request, jsonify, render_template
 from pathlib import Path
 import os
 import storage as st
-from parser_infa import parse_mapping_xml
+from parser_infa import parse_repo_file
 from lineage import upstream_lineage_multi
 
-
-PRELOAD_ON_START   = os.getenv("PRELOAD_ON_START", "0") == "1"  # default: skip preload
-AUTO_LOAD_IF_EMPTY = os.getenv("AUTO_LOAD_IF_EMPTY", "1") == "1"  # default: lazy-load on first lookup
-
-# Resolve mappings directory: env var takes precedence, else ./samples next to this file
-_env_dir = os.environ.get("MAPPINGS_DIR")
-MAPPINGS_DIR = Path(_env_dir) if _env_dir and _env_dir.strip() else Path(__file__).resolve().parent / "samples"
-
 app = Flask(__name__)
-
-def _xml_files_in_dir(root: Path):
-    if not root.exists():
-        return []
-    exts = {".xml", ".XML"}
-    return sorted([p for p in root.rglob("*") if p.is_file() and p.suffix in exts])
-
-
-def load_all_mappings_from_dir():
-    """Reset the flat-file store and parse all XMLs from MAPPINGS_DIR."""
-    st.reset_all()
-    xmls = _xml_files_in_dir(MAPPINGS_DIR)
-    loaded, errors = [], []
-    for p in xmls:
-        try:
-            mid = parse_mapping_xml(str(p))
-            loaded.append({"file": str(p), "mapping_id": mid})
-        except Exception as e:
-            errors.append({"file": str(p), "error": str(e)})
-            print(f"[load] failed {p}: {e}")
-    return {"dir": str(MAPPINGS_DIR.resolve()), "files": len(xmls), "loaded": loaded, "errors": errors}
-
-
-# Load once on startup
-if PRELOAD_ON_START:
-    LOAD_INFO = load_all_mappings_from_dir()
-else:
-    LOAD_INFO = {
-        "dir": str(MAPPINGS_DIR.resolve()),
-        "files": 0,
-        "loaded": [],
-        "errors": [],
-        "skipped": True
-    }
-
 
 @app.route("/")
 def index():
@@ -67,11 +24,30 @@ def health():
     }
 
 
-@app.route("/api/reset", methods=["POST"])
+@app.route("/api/reset", methods=["POST"]) 
 def reset():
-    global LOAD_INFO
-    LOAD_INFO = load_all_mappings_from_dir()
-    return jsonify(LOAD_INFO)
+    """(Re)load Informatica mappings. Supports single big XML file or a folder of XMLs.
+    Default path: samples/mappings.xml (set INFA_XML_PATH to override)."""
+    # clear all tables
+    st.reset_all()
+
+    path = os.environ.get("INFA_XML_PATH", os.path.join("samples", "mappings.xml"))
+    loaded, errors = [], []
+
+    try:
+        if os.path.isfile(path):
+            parse_repo_file(path)
+            loaded.append(path)
+        else:
+            # Fallback: parse every *.xml under the directory as a repo file
+            import glob
+            for p in sorted(glob.glob(os.path.join(path, "*.xml"))):
+                parse_repo_file(p)
+                loaded.append(p)
+    except Exception as e:
+        errors.append({"file": path, "error": str(e)})
+
+    return jsonify({"loaded": loaded, "errors": errors})
 
 
 @app.route("/api/lookup")
