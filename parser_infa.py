@@ -1,6 +1,6 @@
-# parser_infa.py
 from lxml import etree as ET
 from typing import List, Dict, Tuple
+from collections import defaultdict
 import re
 import storage as st
 
@@ -60,6 +60,13 @@ def _expr_text_from_port(pf) -> str:
         if v:
             return v
     return ""
+
+
+def _phys_oid(kind: str, full: str, folder: str, name: str) -> str:
+    full = (full or "").strip().upper()
+    if full:
+        return f"{kind}:{full}"
+    return f"{kind}:{folder.upper()}::{(name or '').upper()}"
 
 # ==========================
 # Mapplet support
@@ -158,345 +165,6 @@ def _parse_mapplet_def(mp_el) -> Dict:
         "out_port_owners": out_port_owners,
     }
 
-# ==========================
-# SQL override support
-# ==========================
-
-def _extract_sql_override_from_attrs(t) -> str:
-    for ta in t.findall("./TABLEATTRIBUTE"):
-        name = (ta.get("NAME") or "").lower()
-        val  = ta.get("VALUE") or ta.text or ""
-        if not val:
-            continue
-        if any(k in name for k in ("sql", "override", "query")):
-            return val
-    return ""
-
-
-def _parse_sql_dependencies(sql: str):
-    """
-    Return (tables, selects, joins_text)
-      tables: dict alias->full (e.g., 'C'->'DB.SCH.TABLE')
-      selects: dict out_name -> list of (alias, column)
-      joins_text: string with ON conditions
-    """
-    if not _HAS_SQLGLOT:
-        return {}, {}, ""
-    try:
-        root = _sg.parse_one(sql, read="ansi")
-    except Exception:
-        return {}, {}, ""
-
-    tables = {}
-    for t in root.find_all(_sge.Table):
-        alias = (t.alias_or_name or t.name)
-        parts = [p for p in (t.db, t.catalog, t.this) if p]
-        full = ".".join([p.upper() for p in parts]) if parts else (t.name or alias)
-        tables[alias] = full
-
-    selects = {}
-    select_expr = getattr(root, "select", None)
-    if select_expr:
-        for proj in select_expr.expressions:
-            out = proj.alias_or_name
-            if not out and isinstance(proj, _sge.Column):
-                out = proj.name
-            out = out or ""
-            refs = []
-            for col in proj.find_all(_sge.Column):
-                alias = (col.table or "")
-                name  = col.name or ""
-                if name:
-                    refs.append((alias, name))
-            if out:
-                seen = set()
-                for r in refs:
-                    if r not in seen:
-                        selects.setdefault(out, []).append(r)
-                        seen.add(r)
-
-    join_parts = []
-    for j in root.find_all(_sge.Join):
-        on = j.args.get("on")
-        if on is not None:
-            join_parts.append(on.sql())
-    joins_text = " AND ".join(join_parts)
-
-    return tables, selects, joins_text
-
-# ==========================
-# Main per-mapping parser (element-based)
-# ==========================
-
-def parse_mapping_element(mapping, folder: str,
-                          folder_sources: Dict[str, Dict],
-                          folder_targets: Dict[str, Dict],
-                          folder_mapplets: Dict[str, Dict]) -> str:
-    mapping_name = mapping.get("NAME") or "(unnamed)"
-    mapping_id = _id(folder, mapping_name)
-
-    # Buckets
-    instances: List[Dict] = []
-    ports:     List[Dict] = []
-    edges:     List[Dict] = []
-    exprs:     List[Dict] = []
-    physical_objects: List[Dict] = []
-    map_sources: List[Dict] = []
-    map_targets: List[Dict] = []
-    instance_phys: List[Dict] = []
-    sq_assoc:  List[Dict] = []
-
-    def _add_instance(inst_name: str, inst_type: str) -> str:
-        inst_id = _id(mapping_id, inst_name)
-        instances.append({
-            "instance_id": inst_id,
-            "mapping_id": mapping_id,
-            "type": inst_type,
-            "name": inst_name,
-        })
-        return inst_id
-
-    def _add_port(inst_id: str, name: str, direction: str, dtype: str = ""):
-        ports.append({
-            "port_id": _id(inst_id, name),
-            "instance_id": inst_id,
-            "name": name,
-            "dtype": dtype,
-            "direction": direction,
-        })
-
-    def _add_ports_for_source_instance(inst_id: str, src_key: str):
-        meta = folder_sources.get(src_key)
-        if not meta:
-            return
-        for fname, dtype in meta["fields"]:
-            _add_port(inst_id, fname, "OUTPUT", dtype)
-        obj_id = _id("SRC", meta["full"])
-        physical_objects.append({
-            "object_id": obj_id,
-            "kind": "SOURCE",
-            "db": meta["db"],
-            "schema": meta["schema"],
-            "name": meta["name"],
-            "full_name": meta["full"],
-        })
-        map_sources.append({"mapping_id": mapping_id, "object_id": obj_id})
-        instance_phys.append({"instance_id": inst_id, "object_id": obj_id, "role": "Source"})
-
-    def _add_ports_for_target_instance(inst_id: str, tgt_key: str):
-        meta = folder_targets.get(tgt_key)
-        if not meta:
-            return
-        for fname, dtype in meta["fields"]:
-            _add_port(inst_id, fname, "INPUT", dtype)
-        obj_id = _id("TGT", meta["full"])
-        physical_objects.append({
-            "object_id": obj_id,
-            "kind": "TARGET",
-            "db": meta["db"],
-            "schema": meta["schema"],
-            "name": meta["name"],
-            "full_name": meta["full"],
-        })
-        map_targets.append({"mapping_id": mapping_id, "object_id": obj_id})
-        instance_phys.append({"instance_id": inst_id, "object_id": obj_id, "role": "Target"})
-
-    # --- Transformations (instances + ports + strict edges from expressions)
-    tx_names = set()
-    for t in mapping.findall("./TRANSFORMATION"):
-        t_name = t.get("NAME")
-        t_type = t.get("TYPE") or "Transformation"
-        tx_names.add(t_name)
-        inst_id = _add_instance(t_name, t_type)
-
-        input_names: List[str] = []
-        var_names:   List[str] = []
-        outputs:     List[Dict] = []
-        var_exprs:   Dict[str, str] = {}
-
-        for pf in t.findall("./TRANSFORMFIELD"):
-            pname = pf.get("NAME")
-            if not pname:
-                continue
-            pdir  = (pf.get("PORTTYPE") or "").upper()
-            dtype = pf.get("DATATYPE") or ""
-            pid   = _id(inst_id, pname)
-
-            direction = pdir if pdir in ("INPUT", "OUTPUT", "VARIABLE") else "VARIABLE"
-            _add_port(inst_id, pname, direction, dtype)
-
-            expr_text = _expr_text_from_port(pf)
-            expr_name = (pf.get("EXPRESSIONNAME") or pf.get("EXPRESSION_NAME") or "")
-
-            if expr_text and direction in ("OUTPUT", "VARIABLE"):
-                exprs.append({
-                    "port_id": pid,
-                    "kind":   "expr",
-                    "raw":    expr_text,
-                    "meta":   expr_name,
-                })
-
-            if direction == "INPUT":
-                input_names.append(pname)
-            elif direction == "VARIABLE":
-                var_names.append(pname)
-                if expr_text:
-                    var_exprs[pname] = expr_text
-            elif direction == "OUTPUT":
-                outputs.append({"name": pname, "expr_text": expr_text})
-
-        # record join/filter text (metadata only)
-        for ta in t.findall("./TABLEATTRIBUTE"):
-            aname = (ta.get("NAME") or "").lower()
-            aval  = ta.get("VALUE") or ""
-            if not aval:
-                continue
-            if "join" in aname or aname in ("join condition", "joiner condition"):
-                exprs.append({
-                    "port_id": _id(inst_id, "__join__"),
-                    "kind": "join",
-                    "raw": aval,
-                    "meta": aname,
-                })
-
-        inputs_ci = {n.lower(): n for n in input_names}
-        vars_ci   = {n.lower(): n for n in var_names}
-
-        # STRICT wiring for VARIABLEs: tokens in a var's expression feed the var
-        for vname, vexpr in var_exprs.items():
-            tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", vexpr)
-            v_pid  = _id(inst_id, vname)
-            for tok in tokens:
-                tci = tok.lower()
-                if tci in inputs_ci:
-                    in_pid = _id(inst_id, inputs_ci[tci])
-                    if in_pid != v_pid:
-                        edges.append({"from_port_id": in_pid, "to_port_id": v_pid})
-                elif tci in vars_ci and vars_ci[tci] != vname:
-                    in_pid = _id(inst_id, vars_ci[tci])
-                    edges.append({"from_port_id": in_pid, "to_port_id": v_pid})
-
-        # STRICT wiring for OUTPUTs: tokens in OUTPUT expr feed the output
-        for od in outputs:
-            out_name = od["name"]
-            out_pid  = _id(inst_id, out_name)
-            expr_txt = od["expr_text"] or ""
-            if not expr_txt:
-                continue
-            tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr_txt)
-            for tok in tokens:
-                tci = tok.lower()
-                if tci in inputs_ci:
-                    in_pid = _id(inst_id, inputs_ci[tci])
-                    if in_pid != out_pid:
-                        edges.append({"from_port_id": in_pid, "to_port_id": out_pid})
-                elif tci in vars_ci:
-                    in_pid = _id(inst_id, vars_ci[tci])
-                    if in_pid != out_pid:
-                        edges.append({"from_port_id": in_pid, "to_port_id": out_pid})
-
-        # SQL overrides (SQ/Lookup)
-        t_type_low = (t.get("TYPE") or "").strip().lower()
-        is_sq     = "source qualifier" in t_type_low
-        is_lookup = (t_type_low in ("lookup", "lookup procedure")) or ("lookup" in t_type_low)
-        if is_sq or is_lookup:
-            sql_text = _extract_sql_override_from_attrs(t)
-            if sql_text:
-                _apply_sql_override(mapping_id, inst_id, inst_name=t.get("NAME"), sql_text=sql_text, is_lookup=is_lookup,
-                                    instances=instances, ports=ports, edges=edges, exprs=exprs,
-                                    physical_objects=physical_objects, map_sources=map_sources, instance_phys=instance_phys)
-
-    # --- INSTANCE binding (Source/Target/Mapplet classification)
-    instance_type_by_name: Dict[str, str] = {}
-    instance_refname_by_name: Dict[str, str] = {}
-    instance_is_mapplet: Dict[str, bool] = {}
-
-    for inst in mapping.findall(".//INSTANCE"):
-        iname   = _aget(inst, "NAME", "INSTANCE_NAME")
-        if not iname:
-            continue
-        rawt    = (_aget(inst, "TYPE", "TRANSFORMATION_TYPE", "TRANSFORMATIONTYPE") or "").strip().lower()
-        refname = _aget(inst, "TRANSFORMATION_NAME", "REFOBJECTNAME", "REF_OBJECT_NAME", "REFOBJECT_NAME", "TRANFIRMATION_NAME") or ""
-        refU    = (refname or "").upper()
-
-        is_target = (rawt in ("target", "target definition")) or (refU in folder_targets)
-        is_source = (rawt in ("source", "source definition")) or (refU in folder_sources)
-        is_mapplet = (rawt == "mapplet") or (refU in folder_mapplets)
-
-        if is_target:
-            instance_type_by_name[iname] = "Target"
-        elif is_source:
-            instance_type_by_name[iname] = "Source"
-        else:
-            instance_type_by_name[iname] = "Transformation"
-        instance_refname_by_name[iname] = refname
-        if is_mapplet:
-            instance_is_mapplet[iname] = True
-
-        # Source Qualifier association(s)
-        if rawt == "source qualifier":
-            assoc_attr = _aget(inst, "ASSOCIATED_SOURCE_INSTANCE", "ASSOCIATEDSOURCEINSTANCE")
-            if assoc_attr:
-                sq_assoc.append({
-                    "mapping_id": mapping_id,
-                    "sq_instance_id": _id(mapping_id, iname),
-                    "source_instance_name": assoc_attr.strip(),
-                })
-            for child in inst.findall("./ASSOCIATED_SOURCE_INSTANCE"):
-                nm = (child.get("NAME") or child.get("INSTANCE") or (child.text or "")).strip()
-                if nm:
-                    sq_assoc.append({
-                        "mapping_id": mapping_id,
-                        "sq_instance_id": _id(mapping_id, iname),
-                        "source_instance_name": nm,
-                    })
-
-    # materialize non-TRANSFORMATION instances
-    for iname, itype in instance_type_by_name.items():
-        if iname in tx_names:
-            continue
-        inst_id = _add_instance(iname, itype)
-
-        refU = (instance_refname_by_name.get(iname, "") or "").upper()
-        if instance_is_mapplet.get(iname) or (refU in folder_mapplets):
-            _expand_mapplet_instance(mapping_id, inst_id, iname, folder_mapplets[refU], instances, ports, edges, exprs)
-            continue
-        if itype == "Source":
-            key = (instance_refname_by_name.get(iname, "") or "").upper()
-            if key:
-                _add_ports_for_source_instance(inst_id, key)
-        elif itype == "Target":
-            key = (instance_refname_by_name.get(iname, "") or "").upper()
-            if key:
-                _add_ports_for_target_instance(inst_id, key)
-
-    # --- CONNECTOR edges (strict)
-    for c in mapping.findall(".//CONNECTOR"):
-        fi = _aget(c, "FROMINSTANCE", "FROM_INSTANCE", "FROMINSTANCENAME")
-        ti = _aget(c, "TOINSTANCE",   "TO_INSTANCE",   "TOINSTANCENAME")
-        fp = _aget(c, "FROMPORT", "FROM_FIELD", "FROMFIELD", "FROMPORTNAME", "FROMFIELDNAME")
-        tp = _aget(c, "TOPORT",  "TO_FIELD",   "TOFIELD",   "TOPORTNAME",  "TOFIELDNAME")
-        if not (fi and fp and ti and tp):
-            continue
-        from_pid = _id(_id(mapping_id, fi), fp)
-        to_pid   = _id(_id(mapping_id, ti), tp)
-        edges.append({"from_port_id": from_pid, "to_port_id": to_pid})
-
-    # Persist
-    st.upsert("mappings", [{"mapping_id": mapping_id, "name": mapping_name, "folder": folder}], ("mapping_id",))
-    st.insert_if_missing("instances", instances, ("instance_id",))
-    st.insert_if_missing("ports", ports, ("port_id",))
-    st.insert_if_missing("edges", edges, ("from_port_id", "to_port_id"))
-    st.insert_if_missing("expressions", exprs, ("port_id", "kind", "raw"))
-    st.insert_if_missing("physical_objects", physical_objects, ("object_id",))
-    st.insert_if_missing("map_sources", map_sources, ("mapping_id", "object_id"))
-    st.insert_if_missing("map_targets", map_targets, ("mapping_id", "object_id"))
-    st.insert_if_missing("instance_phys", instance_phys, ("instance_id", "object_id"))
-    st.insert_if_missing("sq_assoc", sq_assoc, ("mapping_id", "sq_instance_id", "source_instance_name"))
-
-    return mapping_id
-
-# Mapplet expansion (inliner)
 
 def _expand_mapplet_instance(mapping_id: str, inst_id: str, inst_name: str, mpdef: Dict,
                              instances: List[Dict], ports: List[Dict], edges: List[Dict], exprs: List[Dict]):
@@ -586,7 +254,72 @@ def _expand_mapplet_instance(mapping_id: str, inst_id: str, inst_name: str, mpde
                     "to_port_id":   _id(inst_id, p),
                 })
 
-# SQL override applier (uses parser buckets from caller)
+# ==========================
+# SQL override support
+# ==========================
+
+def _extract_sql_override_from_attrs(t) -> str:
+    for ta in t.findall("./TABLEATTRIBUTE"):
+        name = (ta.get("NAME") or "").lower()
+        val  = ta.get("VALUE") or ta.text or ""
+        if not val:
+            continue
+        if any(k in name for k in ("sql", "override", "query")):
+            return val
+    return ""
+
+
+def _parse_sql_dependencies(sql: str):
+    """
+    Return (tables, selects, joins_text)
+      tables: dict alias->full (e.g., 'C'->'DB.SCH.TABLE')
+      selects: dict out_name -> list of (alias, column)
+      joins_text: string with ON conditions
+    """
+    if not _HAS_SQLGLOT:
+        return {}, {}, ""
+    try:
+        root = _sg.parse_one(sql, read="ansi")
+    except Exception:
+        return {}, {}, ""
+
+    tables = {}
+    for t in root.find_all(_sge.Table):
+        alias = (t.alias_or_name or t.name)
+        parts = [p for p in (t.db, t.catalog, t.this) if p]
+        full = ".".join([p.upper() for p in parts]) if parts else (t.name or alias)
+        tables[alias] = full
+
+    selects = {}
+    select_expr = getattr(root, "select", None)
+    if select_expr:
+        for proj in select_expr.expressions:
+            out = proj.alias_or_name
+            if not out and isinstance(proj, _sge.Column):
+                out = proj.name
+            out = out or ""
+            refs = []
+            for col in proj.find_all(_sge.Column):
+                alias = (col.table or "")
+                name  = col.name or ""
+                if name:
+                    refs.append((alias, name))
+            if out:
+                seen = set()
+                for r in refs:
+                    if r not in seen:
+                        selects.setdefault(out, []).append(r)
+                        seen.add(r)
+
+    join_parts = []
+    for j in root.find_all(_sge.Join):
+        on = j.args.get("on")
+        if on is not None:
+            join_parts.append(on.sql())
+    joins_text = " AND ".join(join_parts)
+
+    return tables, selects, joins_text
+
 
 def _apply_sql_override(mapping_id: str, sq_inst_id: str, inst_name: str, sql_text: str, is_lookup: bool,
                         instances: List[Dict], ports: List[Dict], edges: List[Dict], exprs: List[Dict],
@@ -615,7 +348,7 @@ def _apply_sql_override(mapping_id: str, sq_inst_id: str, inst_name: str, sql_te
             "type": "Source",
             "name": src_inst_name,
         })
-        obj_id = _id("SRC", full)
+        obj_id = _phys_oid("SRC", full, mapping_id.split(":")[0], full.split(".")[-1])
         physical_objects.append({
             "object_id": obj_id,
             "kind": "SOURCE",
@@ -730,19 +463,376 @@ def parse_repo_file(xml_path: str) -> None:
             elem.clear()
     del ctx
 
-# Back-compat: first mapping in file
+# ==========================
+# Main per-mapping parser (element-based)
+# ==========================
 
-def parse_mapping_xml(xml_path: str) -> str:
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    folder_el  = root.find(".//FOLDER")
-    mapping_el = folder_el.find("./MAPPING") if folder_el is not None else root.find(".//MAPPING")
-    if folder_el is None or mapping_el is None:
-        raise ValueError(f"FOLDER or MAPPING not found in {xml_path}")
+def parse_mapping_element(mapping, folder: str,
+                          folder_sources: Dict[str, Dict],
+                          folder_targets: Dict[str, Dict],
+                          folder_mapplets: Dict[str, Dict]) -> str:
+    mapping_name = mapping.get("NAME") or "(unnamed)"
+    mapping_id = _id(folder, mapping_name)
 
-    folder_name   = folder_el.get("NAME") or "UNKNOWN"
-    f_sources     = _collect_folder_sources(folder_el)
-    f_targets     = _collect_folder_targets(folder_el)
-    f_mapplets    = _collect_folder_mapplets(folder_el)
+    # Buckets
+    instances: List[Dict] = []
+    ports:     List[Dict] = []
+    edges:     List[Dict] = []
+    exprs:     List[Dict] = []
+    physical_objects: List[Dict] = []
+    map_sources: List[Dict] = []
+    map_targets: List[Dict] = []
+    instance_phys: List[Dict] = []
+    sq_assoc:  List[Dict] = []
 
-    return parse_mapping_element(mapping_el, folder_name, f_sources, f_targets, f_mapplets)
+    def _add_instance(inst_name: str, inst_type: str) -> str:
+        inst_id = _id(mapping_id, inst_name)
+        instances.append({
+            "instance_id": inst_id,
+            "mapping_id": mapping_id,
+            "type": inst_type,
+            "name": inst_name,
+        })
+        return inst_id
+
+    def _add_port(inst_id: str, name: str, direction: str, dtype: str = ""):
+        ports.append({
+            "port_id": _id(inst_id, name),
+            "instance_id": inst_id,
+            "name": name,
+            "dtype": dtype,
+            "direction": direction,
+        })
+
+    def _add_ports_for_source_instance(inst_id: str, src_key: str):
+        meta = folder_sources.get(src_key)
+        if not meta:
+            print(f"[WARN] folder_sources has no key '{src_key}' for mapping {mapping_name}")
+            return
+        for fname, dtype in meta["fields"]:
+            _add_port(inst_id, fname, "OUTPUT", dtype)
+        obj_id = _phys_oid("SRC", meta["full"], folder, meta["name"])
+        physical_objects.append({
+            "object_id": obj_id,
+            "kind": "SOURCE",
+            "db": meta["db"],
+            "schema": meta["schema"],
+            "name": meta["name"],
+            "full_name": meta["full"],
+        })
+        map_sources.append({"mapping_id": mapping_id, "object_id": obj_id})
+        instance_phys.append({"instance_id": inst_id, "object_id": obj_id, "role": "Source"})
+
+    def _add_ports_for_target_instance(inst_id: str, tgt_key: str):
+        meta = folder_targets.get(tgt_key)
+        if not meta:
+            print(f"[WARN] folder_targets has no key '{tgt_key}' for mapping {mapping_name}")
+            return
+        for fname, dtype in meta["fields"]:
+            _add_port(inst_id, fname, "INPUT", dtype)
+        obj_id = _phys_oid("TGT", meta["full"], folder, meta["name"])
+        physical_objects.append({
+            "object_id": obj_id,
+            "kind": "TARGET",
+            "db": meta["db"],
+            "schema": meta["schema"],
+            "name": meta["name"],
+            "full_name": meta["full"],
+        })
+        map_targets.append({"mapping_id": mapping_id, "object_id": obj_id})
+        instance_phys.append({"instance_id": inst_id, "object_id": obj_id, "role": "Target"})
+
+    # --- Transformations (instances + ports + strict edges from expressions)
+    tx_names = set()
+    for t in mapping.findall("./TRANSFORMATION"):
+        t_name = t.get("NAME")
+        t_type = t.get("TYPE") or "Transformation"
+        tx_names.add(t_name)
+        inst_id = _add_instance(t_name, t_type)
+
+        input_names: List[str] = []
+        var_names:   List[str] = []
+        outputs:     List[Dict] = []
+        var_exprs:   Dict[str, str] = {}
+        ref_by_port: Dict[str, str] = {}  # OUTPUT/alias -> referenced port name
+
+        for pf in t.findall("./TRANSFORMFIELD"):
+            pname = pf.get("NAME")
+            if not pname:
+                continue
+            pdir  = (pf.get("PORTTYPE") or "").upper()
+            dtype = pf.get("DATATYPE") or ""
+            pid   = _id(inst_id, pname)
+
+            direction = pdir if pdir in ("INPUT", "OUTPUT", "VARIABLE") else "VARIABLE"
+            _add_port(inst_id, pname, direction, dtype)
+
+            # capture REF_FIELD (alias of another port)
+            ref = (
+                pf.get("REF_FIELD") or pf.get("REF_FIELD_NAME") or pf.get("REFERENCE_FIELD") or
+                pf.get("REFPORT") or pf.get("REF_PORT") or pf.get("REF_TRANSFORMFIELD")
+            )
+            if ref:
+                ref_by_port[pname] = ref
+
+            expr_text = _expr_text_from_port(pf)
+            expr_name = (pf.get("EXPRESSIONNAME") or pf.get("EXPRESSION_NAME") or "")
+
+            if expr_text and direction in ("OUTPUT", "VARIABLE"):
+                exprs.append({
+                    "port_id": pid,
+                    "kind":   "expr",
+                    "raw":    expr_text,
+                    "meta":   expr_name,
+                })
+
+            if direction == "INPUT":
+                input_names.append(pname)
+            elif direction == "VARIABLE":
+                var_names.append(pname)
+                if expr_text:
+                    var_exprs[pname] = expr_text
+            elif direction == "OUTPUT":
+                outputs.append({"name": pname, "expr_text": expr_text})
+
+        # record join/filter text (metadata only)
+        for ta in t.findall("./TABLEATTRIBUTE"):
+            aname = (ta.get("NAME") or "").lower()
+            aval  = ta.get("VALUE") or ""
+            if not aval:
+                continue
+            if "join" in aname or aname in ("join condition", "joiner condition"):
+                exprs.append({
+                    "port_id": _id(inst_id, "__join__"),
+                    "kind": "join",
+                    "raw": aval,
+                    "meta": aname,
+                })
+
+        inputs_ci = {n.lower(): n for n in input_names}
+        vars_ci   = {n.lower(): n for n in var_names}
+
+        # STRICT wiring for VARIABLEs: tokens in a var's expression feed the var
+        for vname, vexpr in var_exprs.items():
+            tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", vexpr)
+            v_pid  = _id(inst_id, vname)
+            for tok in tokens:
+                tci = tok.lower()
+                if tci in inputs_ci:
+                    in_pid = _id(inst_id, inputs_ci[tci])
+                    if in_pid != v_pid:
+                        edges.append({"from_port_id": in_pid, "to_port_id": v_pid})
+                elif tci in vars_ci and vars_ci[tci] != vname:
+                    in_pid = _id(inst_id, vars_ci[tci])
+                    edges.append({"from_port_id": in_pid, "to_port_id": v_pid})
+
+        # STRICT wiring for OUTPUTs: tokens in OUTPUT expr feed the output
+        for od in outputs:
+            out_name = od["name"]
+            out_pid  = _id(inst_id, out_name)
+            expr_txt = od["expr_text"] or ""
+            if not expr_txt:
+                continue
+            tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr_txt)
+            for tok in tokens:
+                tci = tok.lower()
+                if tci in inputs_ci:
+                    in_pid = _id(inst_id, inputs_ci[tci])
+                    if in_pid != out_pid:
+                        edges.append({"from_port_id": in_pid, "to_port_id": out_pid})
+                elif tci in vars_ci:
+                    in_pid = _id(inst_id, vars_ci[tci])
+                    if in_pid != out_pid:
+                        edges.append({"from_port_id": in_pid, "to_port_id": out_pid})
+
+        # REF_FIELD wiring: referenced port -> OUTPUT alias
+        all_ci = {}
+        all_ci.update(inputs_ci)
+        all_ci.update(vars_ci)
+        for od in outputs:
+            all_ci.setdefault(od["name"].lower(), od["name"])
+        for out_name, ref_name in ref_by_port.items():
+            out_pid = _id(inst_id, out_name)
+            ref_ci  = (ref_name or "").lower()
+            src_name = all_ci.get(ref_ci)
+            if not src_name or src_name == out_name:
+                continue
+            edges.append({"from_port_id": _id(inst_id, src_name), "to_port_id": out_pid})
+            # If OUTPUT had no expr, copy referenced expr for display
+            has_out_expr = any(e for e in exprs if e["port_id"] == out_pid and e["kind"] == "expr")
+            if not has_out_expr:
+                src_pid = _id(inst_id, src_name)
+                src_expr = next((e["raw"] for e in exprs if e["port_id"] == src_pid and e["kind"] == "expr"), "")
+                if src_expr:
+                    exprs.append({
+                        "port_id": out_pid,
+                        "kind":   "expr",
+                        "raw":    src_expr,
+                        "meta":   "via_ref_field",
+                    })
+
+        # SQL overrides (SQ/Lookup)
+        t_type_low = (t.get("TYPE") or "").strip().lower()
+        is_sq     = "source qualifier" in t_type_low
+        is_lookup = (t_type_low in ("lookup", "lookup procedure")) or ("lookup" in t_type_low)
+        if is_sq or is_lookup:
+            sql_text = _extract_sql_override_from_attrs(t)
+            if sql_text:
+                _apply_sql_override(mapping_id, inst_id, inst_name=t.get("NAME"), sql_text=sql_text, is_lookup=is_lookup,
+                                    instances=instances, ports=ports, edges=edges, exprs=exprs,
+                                    physical_objects=physical_objects, map_sources=map_sources, instance_phys=instance_phys)
+
+    # --- Pre-index connector directions for classification disambiguation
+    incoming = defaultdict(int)
+    outgoing = defaultdict(int)
+    for c in mapping.findall(".//CONNECTOR"):
+        fi = _aget(c, "FROMINSTANCE", "FROM_INSTANCE", "FROMINSTANCENAME")
+        ti = _aget(c, "TOINSTANCE",   "TO_INSTANCE",   "TOINSTANCENAME")
+        if fi: outgoing[fi] += 1
+        if ti: incoming[ti] += 1
+
+    # --- INSTANCE binding (robust classification)
+    instance_type_by_name: Dict[str, str] = {}
+    instance_refname_by_name: Dict[str, str] = {}
+    instance_is_mapplet: Dict[str, bool] = {}
+    source_key_by_instance: Dict[str, str] = {}
+    target_key_by_instance: Dict[str, str] = {}
+
+    def _resolve_source_folder_key(inst) -> str:
+        for a in ("TRANSFORMATION_NAME","REFOBJECTNAME","REF_OBJECT_NAME","REFOBJECT_NAME","TRANFIRMATION_NAME","NAME","INSTANCE_NAME"):
+            v = inst.get(a)
+            if v and v.strip().upper() in folder_sources:
+                return v.strip().upper()
+        return ""
+
+    def _resolve_target_folder_key(inst) -> str:
+        for a in ("TRANSFORMATION_NAME","REFOBJECTNAME","REF_OBJECT_NAME","REFOBJECT_NAME","TRANFIRMATION_NAME","NAME","INSTANCE_NAME"):
+            v = inst.get(a)
+            if v and v.strip().upper() in folder_targets:
+                return v.strip().upper()
+        return ""
+
+    for inst in mapping.findall(".//INSTANCE"):
+        iname   = _aget(inst, "NAME", "INSTANCE_NAME")
+        if not iname:
+            continue
+        rawt    = (_aget(inst, "TYPE", "TRANSFORMATION_TYPE", "TRANSFORMATIONTYPE") or "").strip().lower()
+        refname = _aget(inst, "TRANSFORMATION_NAME", "REFOBJECTNAME", "REF_OBJECT_NAME", "REFOBJECT_NAME", "TRANFIRMATION_NAME") or ""
+        refU    = (refname or iname or "").strip().upper()
+
+        # Prefer explicit TYPE
+        if rawt in ("source", "source definition"):
+            itype = "Source"
+        elif rawt in ("target", "target definition"):
+            itype = "Target"
+        else:
+            ref_is_source = refU in folder_sources
+            ref_is_target = refU in folder_targets
+            if ref_is_source and not ref_is_target:
+                itype = "Source"
+            elif ref_is_target and not ref_is_source:
+                itype = "Target"
+            elif ref_is_source and ref_is_target:
+                inc = incoming.get(iname, 0)
+                out = outgoing.get(iname, 0)
+                if out > 0 and inc == 0:
+                    itype = "Source"
+                elif inc > 0 and out == 0:
+                    itype = "Target"
+                else:
+                    itype = "Transformation"
+            else:
+                itype = "Transformation"
+
+        instance_type_by_name[iname] = itype
+        instance_refname_by_name[iname] = refname or iname
+
+        # mapplet detection (keep type as Transformation; we'll expand later)
+        is_mapplet = (rawt == "mapplet") or (refU in folder_mapplets)
+        if is_mapplet:
+            instance_is_mapplet[iname] = True
+
+        # store deterministic folder keys for binding
+        if itype == "Source":
+            k = _resolve_source_folder_key(inst)
+            if k: source_key_by_instance[iname] = k
+        elif itype == "Target":
+            k = _resolve_target_folder_key(inst)
+            if k: target_key_by_instance[iname] = k
+
+        # Source Qualifier association(s) (remember for synthesis)
+        if rawt == "source qualifier":
+            assoc_attr = _aget(inst, "ASSOCIATED_SOURCE_INSTANCE", "ASSOCIATEDSOURCEINSTANCE")
+            if assoc_attr:
+                sq_assoc.append({
+                    "mapping_id": mapping_id,
+                    "sq_instance_id": _id(mapping_id, iname),
+                    "source_instance_name": assoc_attr.strip(),
+                })
+            for child in inst.findall("./ASSOCIATED_SOURCE_INSTANCE"):
+                nm = (child.get("NAME") or child.get("INSTANCE") or (child.text or "")).strip()
+                if nm:
+                    sq_assoc.append({
+                        "mapping_id": mapping_id,
+                        "sq_instance_id": _id(mapping_id, iname),
+                        "source_instance_name": nm,
+                    })
+
+    # Synthesize missing Source instances referenced by SQ associations
+    for link in sq_assoc:
+        sname = link["source_instance_name"]
+        if sname not in instance_type_by_name:
+            instance_type_by_name[sname] = "Source"
+            # choose a folder key if available
+            sU = sname.strip().upper()
+            if sU in folder_sources:
+                source_key_by_instance[sname] = sU
+
+    # materialize non-TRANSFORMATION instances
+    for iname, itype in instance_type_by_name.items():
+        if iname in tx_names:
+            continue
+        inst_id = _add_instance(iname, itype)
+
+        refU = (instance_refname_by_name.get(iname, "") or "").upper()
+        if instance_is_mapplet.get(iname) and refU in folder_mapplets:
+            _expand_mapplet_instance(mapping_id, inst_id, iname, folder_mapplets[refU], instances, ports, edges, exprs)
+            continue
+        if itype == "Source":
+            key = source_key_by_instance.get(iname, "")
+            if key:
+                _add_ports_for_source_instance(inst_id, key)
+            else:
+                print(f"[WARN] Source instance '{iname}' did not resolve to a folder SOURCE; skipping bind.")
+        elif itype == "Target":
+            key = target_key_by_instance.get(iname, "")
+            if key:
+                _add_ports_for_target_instance(inst_id, key)
+            else:
+                print(f"[WARN] Target instance '{iname}' did not resolve to a folder TARGET; skipping bind.")
+
+    # --- CONNECTOR edges (strict)
+    for c in mapping.findall(".//CONNECTOR"):
+        fi = _aget(c, "FROMINSTANCE", "FROM_INSTANCE", "FROMINSTANCENAME")
+        ti = _aget(c, "TOINSTANCE",   "TO_INSTANCE",   "TOINSTANCENAME")
+        fp = _aget(c, "FROMPORT", "FROM_FIELD", "FROMFIELD", "FROMPORTNAME", "FROMFIELDNAME")
+        tp = _aget(c, "TOPORT",  "TO_FIELD",   "TOFIELD",   "TOPORTNAME",  "TOFIELDNAME")
+        if not (fi and fp and ti and tp):
+            continue
+        from_pid = _id(_id(mapping_id, fi), fp)
+        to_pid   = _id(_id(mapping_id, ti), tp)
+        edges.append({"from_port_id": from_pid, "to_port_id": to_pid})
+
+    # Persist
+    st.upsert("mappings", [{"mapping_id": mapping_id, "name": mapping_name, "folder": folder}], ("mapping_id",))
+    st.insert_if_missing("instances", instances, ("instance_id",))
+    st.insert_if_missing("ports", ports, ("port_id",))
+    st.insert_if_missing("edges", edges, ("from_port_id", "to_port_id"))
+    st.insert_if_missing("expressions", exprs, ("port_id", "kind", "raw"))
+    st.insert_if_missing("physical_objects", physical_objects, ("object_id",))
+    st.insert_if_missing("map_sources", map_sources, ("mapping_id", "object_id"))
+    st.insert_if_missing("map_targets", map_targets, ("mapping_id", "object_id"))
+    st.insert_if_missing("instance_phys", instance_phys, ("instance_id", "object_id"))
+    st.insert_if_missing("sq_assoc", sq_assoc, ("mapping_id", "sq_instance_id", "source_instance_name"))
+
+    return mapping_id
